@@ -1,0 +1,14 @@
+[Desktop Entry]
+Type=Application
+# The panel announces itself on the bus as `dev.clipnest.Panel`, and GNOME looks
+# for a desktop file with exactly that name to know which application a window
+# belongs to. Without this file the panel is an anonymous window in the shell's
+# window list; with it, it has a name and an icon.
+Name=ClipNest
+Comment=Clipboard history for GNOME on Wayland
+Exec=/usr/bin/clipnest toggle
+Icon=dev.clipnest.Panel
+Terminal=false
+NoDisplay=true
+Categories=Utility;
+StartupNotify=false

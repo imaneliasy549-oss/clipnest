@@ -1,0 +1,10 @@
+/target
+/dist
+
+# Agent/tooling state, not part of the project.
+/.freebuff
+
+# Release artifacts that end up beside the source when someone builds by hand.
+*.deb
+*.rpm
+*.pkg.tar.zst

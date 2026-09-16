@@ -1,0 +1,77 @@
+[package]
+name = "clipnest"
+version = "0.7.0"
+edition = "2021"
+description = "Minimal keyboard-driven clipboard history for GNOME on Wayland"
+license = "MIT"
+readme = "README.md"
+authors = ["Iman Elyasi <imaneliasy549@gmail.com>"]
+keywords = ["clipboard", "gnome", "wayland", "gtk4"]
+categories = ["command-line-utilities", "gui"]
+# Fill these in once the repository is on GitHub: the package's Homepage field
+# and anything that links back to the project use them.
+homepage = "https://github.com/imaneliasy549-oss/clipnest"
+repository = "https://github.com/imaneliasy549-oss/clipnest"
+
+[dependencies]
+# v4_8 unlocks gdk::Texture::from_bytes (decoding clipboard images from
+# memory) and gtk::ContentFit. GNOME 45+ ships a much newer GTK anyway.
+gtk = { package = "gtk4", version = "0.10", features = ["v4_8"] }
+adw = { package = "libadwaita", version = "0.8" }
+glib = "0.21"
+gio = "0.21"
+rusqlite = "0.32"
+sha2 = "0.10"
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+strip = true
+
+# `cargo deb` reads everything below to build the .deb a release attaches.
+[package.metadata.deb]
+name = "clipnest"
+maintainer = "Iman Elyasi <imaneliasy549@gmail.com>"
+copyright = "2026, Iman Elyasi <imaneliasy549@gmail.com>"
+license-file = ["LICENSE", "4"]
+section = "utils"
+priority = "optional"
+# `$auto` asks dpkg-shlibdeps what the binary really links (libgtk-4-1,
+# libadwaita-1-0, libsqlite3-0, libc6 ...) instead of guessing, so the package
+# installs on anything with those libraries.
+depends = "$auto"
+recommends = "gnome-shell (>= 45)"
+# Auto-paste goes through the desktop portal, which needs the frontend and a
+# backend that speaks RemoteDesktop. Both are part of a normal GNOME install, but
+# a minimal session can be missing them, and a suggestion is the honest way to
+# say so - the daemon still works without them, it just copies.
+suggests = "xdg-desktop-portal, xdg-desktop-portal-gnome | xdg-desktop-portal-kde"
+extended-description = """ClipNest keeps a searchable history of everything you copy, opened with
+Win+Shift+V (Super+Shift+V), like the clipboard popup on Windows.
+
+On GNOME Wayland the clipboard belongs to the compositor, and Mutter implements
+no data-control protocol, so an ordinary background process cannot read it.
+ClipNest therefore comes in two halves: a small gnome-shell extension that
+forwards clipboard changes, and a GTK4 daemon that stores them in SQLite, shows
+the panel and puts an entry back on the clipboard.
+
+Text and images are both supported, entries can be pinned so trimming never
+removes them, and the history has size limits that a settings file can adjust.
+`clipnest setup` finishes the installation for the current user; run it once
+after installing."""
+
+assets = [
+    # The daemon and the panel are the same binary: `clipnest toggle` opens the
+    # panel on a running daemon, `clipnest daemon` is what systemd starts.
+    ["target/release/clipnest", "usr/bin/", "755"],
+    ["data/deb/clipnest.service", "usr/lib/systemd/user/", "644"],
+    ["data/deb/dev.clipnest.Daemon.service", "usr/share/dbus-1/services/", "644"],
+    ["extension/metadata.json", "usr/share/gnome-shell/extensions/clipnest@clipnest.dev/", "644"],
+    ["extension/extension.js", "usr/share/gnome-shell/extensions/clipnest@clipnest.dev/", "644"],
+    ["data/clipnest.desktop", "usr/share/applications/", "644"],
+    ["data/icons/hicolor/scalable/apps/dev.clipnest.Panel.svg", "usr/share/icons/hicolor/scalable/apps/", "644"],
+    ["README.md", "usr/share/doc/clipnest/", "644"],
+    ["CHANGELOG.md", "usr/share/doc/clipnest/", "644"],
+]
+maintainer-scripts = "debian"

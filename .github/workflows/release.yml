@@ -1,0 +1,203 @@
+name: Release
+
+# Push a tag like `v0.7.0` and the release page gets the packages for every
+# architecture and distribution family this project supports. Each artifact is
+# built where the libraries it links against actually are, and every package
+# carries the *same* binary per architecture:
+#
+#   linux  - the binary, the .deb and the portable tarball, on Ubuntu 24.04.
+#            That is what keeps the glibc floor at 2.39 and makes the package
+#            installable from 24.04 upwards; building on a newer release would
+#            raise it for nothing.
+#   rpm    - Fedora's own rpmbuild, packaging the tarball the `linux` job built,
+#            so an RPM never sneaks in a newer libc than the .deb has.
+#   source - the source tarball, for anything else, plus the Arch recipe.
+#
+# arm64 comes from GitHub's native arm runners. They are free for public
+# repositories and simply absent for private ones, so the arm jobs are allowed to
+# fail rather than take the whole release down with them.
+#
+# Every path below is relative to the `dist/` layout `make dist` writes - one
+# directory per target (`ubuntu-24.04-amd64/`, `tarball/`, `source/`,
+# `fedora-x86_64/`, `arch-x86_64/`) - which is why the globs are `dist/**/…` and
+# not `dist/*.deb`. A flat glob silently matches nothing, and `if-no-files-found:
+# error` then fails the job at the very end of a release.
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  linux:
+    name: ${{ matrix.arch }}
+    runs-on: ${{ matrix.runner }}
+    continue-on-error: ${{ matrix.optional }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            arch: amd64
+            optional: false
+          - runner: ubuntu-24.04-arm
+            arch: arm64
+            optional: true
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install the build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libgtk-4-dev libadwaita-1-dev libsqlite3-dev dpkg-dev fakeroot
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      # The same checks CI runs: never ship a package whose tests fail.
+      - name: Check and test
+        run: make check
+
+      - name: Install cargo-deb
+        run: cargo install cargo-deb --locked --version 3
+
+      # `make dist` would also want the RPM and the Arch recipe; those come from
+      # the jobs below, which have the right tooling for them.
+      - name: Build the package and the tarball
+        run: make dist-deb dist-tarball CARGO_FLAGS=
+
+      # cargo-deb asks dpkg-shlibdeps what the binary links, so the dependencies
+      # printed here are the real ones - worth having in the release log.
+      - name: Show what was built
+        run: |
+          dpkg-deb --info dist/ubuntu-*/*.deb
+          dpkg-deb --contents dist/ubuntu-*/*.deb
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: packages-${{ matrix.arch }}
+          if-no-files-found: error
+          path: |
+            dist/**/*.deb
+            dist/**/*.tar.gz
+
+  rpm:
+    name: rpm ${{ matrix.arch }}
+    # Fedora's own rpmbuild, so the RPM carries Fedora's dependency generator
+    # output and names the packages Fedora actually ships.
+    runs-on: ${{ matrix.runner }}
+    container: fedora:latest
+    needs: linux
+    continue-on-error: ${{ matrix.optional }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            arch: amd64
+            optional: false
+          - runner: ubuntu-24.04-arm
+            arch: arm64
+            optional: true
+    steps:
+      # A container starts without git, and checkout is a step, so this has to
+      # come first.
+      - name: Prepare the container
+        run: dnf install -y --setopt=install_weak_deps=False git tar gzip rpm-build
+
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: packages-${{ matrix.arch }}
+          path: dist
+
+      # The spec carries `@VERSION@` in its Version tag, and rpmbuild cannot
+      # expand that: a Version tag is a literal, so `--define "version ..."`
+      # leaves an invalid package version behind and the build fails. It is
+      # substituted first, exactly as `make dist-extra` does on a workstation.
+      - name: Fill in the version
+        run: |
+          version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+          sed -e "s/@VERSION@/$version/g" \
+            packaging/rpm/clipnest.spec > clipnest.spec
+          grep -n "^Version:" clipnest.spec
+
+      - name: Build the RPM
+        run: |
+          rpmbuild -bb clipnest.spec \
+            --define "_sourcedir $PWD/dist/tarball" \
+            --define "_rpmdir $PWD/dist/rpm"
+          mv dist/rpm/*/*.rpm dist/
+          rm -rf dist/rpm clipnest.spec
+          rpm -qp --requires dist/*.rpm
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rpm-${{ matrix.arch }}
+          if-no-files-found: error
+          path: dist/**/*.rpm
+
+  source:
+    name: source
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build the source tarball and the recipes
+        run: make dist-source dist-extra
+      # `dist-extra` fills @VERSION@ and @SHA256@ in, so these are the copies
+      # that a user can actually build with.
+      - uses: actions/upload-artifact@v4
+        with:
+          name: source
+          if-no-files-found: error
+          path: |
+            dist/source/*.tar.gz
+            dist/arch-*/PKGBUILD
+            dist/fedora-*/clipnest.spec
+
+  publish:
+    name: publish
+    needs: [linux, rpm, source]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Checksums and a guide to the files
+        run: |
+          # Assets on a release are flat, so the directories the jobs built in
+          # are thrown away here. A file appearing twice under the same name
+          # would be a collision worth failing over, which is what `cp` (not
+          # `cp -n`) does by overwriting the first one.
+          mkdir -p release
+          find dist -type f \
+            \( -name '*.deb' -o -name '*.rpm' -o -name '*.tar.gz' \
+               -o -name 'PKGBUILD' -o -name 'clipnest.spec' \) \
+            -exec cp {} release/ \;
+          cp packaging/dist-README.md release/README.md
+          cd release
+          sha256sum * > SHA256SUMS
+          ls -lh
+          echo
+          echo "== the .deb dependencies (what it installs on) =="
+          dpkg-deb -f *.deb Depends || true
+
+      - name: Attach everything to the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="${GITHUB_REF_NAME}"
+          if ! gh release view "$tag" >/dev/null 2>&1; then
+            gh release create "$tag" --title "ClipNest ${tag#v}" --generate-notes
+          fi
+          gh release upload "$tag" --clobber release/*

@@ -1,0 +1,9 @@
+[D-BUS Service]
+# Lets the session bus start the daemon on demand. The unit itself has no
+# [Install] section on purpose, so this file is what makes `clipnest toggle` and
+# the shell extension able to bring the daemon up - at a moment when the session
+# is definitely ready. `@BIN@` is replaced with the installed binary path at
+# install time (`make install`).
+Name=dev.clipnest.Daemon
+Exec=@BIN@ daemon
+SystemdService=clipnest.service

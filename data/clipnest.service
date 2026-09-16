@@ -1,0 +1,23 @@
+[Unit]
+Description=ClipNest clipboard history
+# Started on demand, never at login: the first D-Bus call (the shell extension
+# forwarding a copy, or `clipnest toggle`) activates this service. Starting it at
+# login instead makes GTK touch xdg-desktop-portal before gnome-shell has put
+# WAYLAND_DISPLAY into the systemd user environment, so the portal's GTK backend
+# dies with "cannot open display" and the whole session then waits out
+# 25-second D-Bus timeouts (Chrome and Nautilus took minutes to open). The shell
+# is the only thing that can push clipboard changes anyway, so waiting for it
+# costs nothing and makes the ordering impossible to get wrong.
+PartOf=graphical-session.target
+
+[Service]
+Type=dbus
+BusName=dev.clipnest.Daemon
+ExecStart=%h/.local/bin/clipnest daemon
+# The daemon owns the panel and the history, so it should always come back.
+Restart=always
+RestartSec=2
+# A wedged start has to fail the caller's D-Bus call instead of hanging on it.
+TimeoutStartSec=30
+
+# No [Install] section on purpose: D-Bus activation replaces `systemctl enable`.

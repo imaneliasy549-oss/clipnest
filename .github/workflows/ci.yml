@@ -1,0 +1,44 @@
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+jobs:
+  check:
+    # 24.04 rather than latest: the toolchain and library versions a release gets
+    # built against should be the oldest ones supported, see release.yml.
+    # arm64 is in the matrix because a second architecture finds real problems - a
+    # system library that is only present on x86, a size assumption, a test that
+    # hard-codes a path. Its runner only exists for public repositories, so that
+    # leg is allowed to fail instead of blocking every pull request.
+    runs-on: ${{ matrix.runner }}
+    continue-on-error: ${{ matrix.optional }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            optional: false
+          - runner: ubuntu-24.04-arm
+            optional: true
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install the build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libgtk-4-dev libadwaita-1-dev libsqlite3-dev
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      # `make check` is clippy with -D warnings plus the test suite; it needs no
+      # display and no database, the tests run against SQLite in memory.
+      - name: Check and test
+        run: make check

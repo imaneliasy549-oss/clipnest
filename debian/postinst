@@ -1,0 +1,23 @@
+#!/bin/sh
+# ClipNest installs system-wide files, but two of the things it needs belong to
+# the user who is going to use it: enabling the shell extension for their
+# account, and registering their keyboard shortcut. A root script cannot do
+# either reliably, so it says so instead of pretending the package is finished.
+set -e
+
+if [ "$1" = "configure" ]; then
+	cat <<'MESSAGE'
+
+ClipNest is installed. Two steps are left, and they are per-user:
+
+    clipnest setup       # enable the shell extension, register Win+Shift+V
+    (then log out and back in once, so GNOME loads the new extension)
+
+Until then the shortcut and the panel work, but new copies are not recorded,
+because nothing is feeding them to the daemon. `/usr/share/doc/clipnest/README.md`
+has the rest: settings, backup, troubleshooting.
+
+MESSAGE
+fi
+
+exit 0

@@ -1,0 +1,71 @@
+# Arch Linux. Unlike the RPM spec this builds from source, which is right for a
+# rolling distribution: the toolchain there is always current, so there is no
+# stale glibc to inherit, and the binary links against the gtk4 and libadwaita
+# that the machine actually runs.
+#
+# `make dist` writes a copy of this file into dist/ with the version and the
+# checksum of the source tarball filled in. To use it by hand:
+#
+#   makepkg -si
+#
+# from a directory holding clipnest-<version>.tar.gz.
+
+pkgname=clipnest
+pkgver=@VERSION@
+pkgrel=1
+pkgdesc="Clipboard history for GNOME on Wayland, with auto-paste"
+arch=('x86_64' 'aarch64')
+url="https://github.com/imaneliasy549-oss/clipnest"
+license=('MIT')
+depends=('gtk4' 'libadwaita' 'sqlite' 'gnome-shell' 'systemd')
+makedepends=('cargo' 'rust' 'pkgconf')
+optdepends=(
+    'xdg-desktop-portal: auto-paste needs it to type into other windows'
+)
+source=("clipnest-$pkgver.tar.gz")
+sha256sums=('@SHA256@')
+
+prepare() {
+    cd "$pkgname-$pkgver"
+    # Fetching here rather than in build() keeps the build itself reproducible
+    # and, with --frozen, offline.
+    cargo fetch --locked
+}
+
+build() {
+    cd "$pkgname-$pkgver"
+    cargo build --release --locked --frozen
+}
+
+check() {
+    cd "$pkgname-$pkgver"
+    cargo test --release --locked --frozen
+}
+
+package() {
+    cd "$pkgname-$pkgver"
+
+    install -Dm755 target/release/clipnest "$pkgdir/usr/bin/clipnest"
+
+    # The unit and the activation file, system-wide this time: every user on the
+    # machine gets the daemon on demand without anything having to exist in their
+    # home directory.
+    install -Dm644 data/deb/clipnest.service \
+        "$pkgdir/usr/lib/systemd/user/clipnest.service"
+    install -Dm644 data/deb/dev.clipnest.Daemon.service \
+        "$pkgdir/usr/share/dbus-1/services/dev.clipnest.Daemon.service"
+
+    install -Dm644 data/clipnest.desktop \
+        "$pkgdir/usr/share/applications/clipnest.desktop"
+    install -Dm644 data/icons/hicolor/scalable/apps/dev.clipnest.Panel.svg \
+        "$pkgdir/usr/share/icons/hicolor/scalable/apps/dev.clipnest.Panel.svg"
+
+    # gnome-shell looks in /usr/share for its extensions on Arch.
+    install -d "$pkgdir/usr/share/gnome-shell/extensions/clipnest@clipnest.dev"
+    install -m644 extension/metadata.json extension/extension.js \
+        "$pkgdir/usr/share/gnome-shell/extensions/clipnest@clipnest.dev/"
+
+    install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+    install -d "$pkgdir/usr/share/doc/$pkgname"
+    install -m644 README.md CHANGELOG.md "$pkgdir/usr/share/doc/$pkgname/"
+}

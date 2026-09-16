@@ -1,0 +1,8 @@
+[D-BUS Service]
+# Ships with the package, so every user on the machine can bring the daemon up
+# on demand without anything having to exist in their home directory. The
+# session bus reads /usr/share/dbus-1/services; the user-level twin of this file
+# is written by `make install` and uses an absolute path in ~/.local/bin.
+Name=dev.clipnest.Daemon
+Exec=/usr/bin/clipnest daemon
+SystemdService=clipnest.service
