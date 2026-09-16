@@ -1,225 +1,541 @@
 # ClipNest
 
-[![CI](https://github.com/imaneliasy549-oss/clipnest/actions/workflows/ci.yml/badge.svg)](https://github.com/imaneliasy549-oss/clipnest/actions/workflows/ci.yml)
-[![Release](https://img.shields.io/github/v/release/imaneliasy549-oss/clipnest)](https://github.com/imaneliasy549-oss/clipnest/releases/latest)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
-[![GNOME 45+](https://img.shields.io/badge/GNOME-45%2B-blue)](https://extensions.gnome.org)
+تاریخچهٔ کلیپ‌بورد سبک و کمینه برای **GNOME روی Wayland** — شبیه `Win+V` ویندوز:
+با `Super+Shift+V` (روی صفحه‌کلید همان `Win+Shift+V`) یک پنل کوچک باز می‌شود،
+تایپ می‌کنی، روی آیتم می‌زنی و **همان‌جا برایت پیست می‌شود**: متن و تصویر هر دو
+پشتیبانی می‌شوند، آیتم‌ها را می‌توان **پین** کرد تا هیچ‌وقت پاک نشوند، و دیتابیس سقف حجم
+دارد تا تاریخچه از کنترل خارج نشود.
 
-> **Clipboard history for GNOME on Wayland.** Press `Super+Shift+V`, type, click an entry — it's pasted into the window you came from. Text, images, pinning, search, size limits.
->
-> **فارسی:** تاریخچهٔ کلیپ‌بورد برای گنوم روی Wayland. با `Super+Shift+V` باز می‌شود، روی آیتم می‌زنی و همان‌جا پیست می‌شود. متن، تصویر، پین، جستجو.
+> **English:** ClipNest keeps a searchable history of everything you copy on
+> GNOME/Wayland: press `Super+Shift+V`, type, click the entry - it is pasted into
+> the window you came from. Download the `.deb` from the
+> [latest release](https://github.com/imaneliasy549-oss/clipnest/releases/latest)
+> and check it against `SHA256SUMS` before installing, then
+> `sudo apt install ./clipnest_<version>-1_amd64.deb`, run `clipnest setup`, log
+> out and back in once. `clipnest help` lists every command, `clipnest config`
+> shows the settings, `clipnest doctor` explains what is wrong. See `CHANGELOG.md`
+> for what each version changed, and `RELEASING.md` for building and publishing.
 
-<!-- Screenshot here: save a screenshot of the panel as docs/screenshot.png and uncomment:
-![ClipNest panel](docs/screenshot.png)
--->
+## چرا اکستنشن لازم است؟
 
----
+روی Wayland کلیپ‌بورد در اختیار کامپوزیتور است. **Mutter هیچ‌کدام از پروتکل‌های
+data-control (`wlr-data-control-unstable-v1` و `ext-data-control-v1`) را پیاده نکرده،**
+پس `wl-clipboard` و هر پردازهٔ پس‌زمینه‌ای که مستقیم بخواهد کلیپ‌بورد را بخواند روی
+GNOME کار نمی‌کند. به همین دلیل کار به دو نیم تقسیم شده:
 
-## Install
-
-### Ubuntu 24.04+ / Debian 13+
-
-```bash
-# amd64
-wget https://github.com/imaneliasy549-oss/clipnest/releases/latest/download/clipnest_0.7.0-1_amd64.deb
-sudo apt install ./clipnest_0.7.0-1_amd64.deb
-
-# arm64
-wget https://github.com/imaneliasy549-oss/clipnest/releases/latest/download/clipnest_0.7.0-1_arm64.deb
-sudo apt install ./clipnest_0.7.0-1_arm64.deb
+```
+┌──────────────────────────────┐         D-Bus          ┌────────────────────────┐
+│ GNOME Shell extension (JS)   │  PushText / PushImage  │  clipnest daemon (Rust)│
+│ تنها بخشی که در پس‌زمینه     │ ─────────────────────► │  تاریخچه در SQLite     │
+│ اجازهٔ خواندن کلیپ‌بورد را دارد │                        │  پنل GTK4/Adw          │
+└──────────────────────────────┘                        └────────────────────────┘
+                                                                 ▲
+                                              Super+Shift+V → clipnest toggle
 ```
 
-Then, **once per user**:
+- **اکستنشن:** هر ۴۰۰ms مقدار کلیپ‌بورد را می‌خواند (`St.Clipboard` سیگنال «تغییر»
+  ندارد، پس خواندن دوره‌ای لازم است) و فقط وقتی مقدار عوض شده باشد می‌فرستد.
+- **دیمن:** تاریخچه را در `~/.local/share/clipnest/history.db` نگه می‌دارد و پنل را
+  نشان می‌دهد. نوشتن روی کلیپ‌بورد از خود پنل انجام می‌شود (وقتی فوکوس دارد) و چون
+  دیمن زنده می‌ماند، انتخاب پابرجا می‌ماند.
+- **میانبر:** یک Custom Shortcut معمولی گنوم (پیش‌فرض `Super+Shift+V`، قابل تغییر با
+  `clipnest setup-shortcut --binding`); توکن فعال‌سازی (`XDG_ACTIVATION_TOKEN`)
+  به دیمن پاس داده می‌شود تا پنل واقعاً فوکوس کیبورد بگیرد.
+
+## چرا سرویس در لاگین اجرا نمی‌شود؟
+
+دیمن **با D-Bus فعال می‌شود، نه با ورود به حساب**: یونیت `Type=dbus` است و
+`BusName=dev.clipnest.Daemon` دارد، پس اولین تماس (کپی‌ای که اکستنشن می‌فرستد، یا
+`clipnest toggle`) آن را بالا می‌آورد. برای همین، `make install` علاوه بر یونیت یک
+فایل فعال‌سازی D-Bus هم در `~/.local/share/dbus-1/services/dev.clipnest.Daemon.service`
+می‌نویسد — همان کاری که خودِ `xdg-desktop-portal` می‌کند.
+
+این عمدی است. اگر دیمن در `graphical-session.target` اجرا شود، مقداردهی GTK4
+پیش از آماده شدن سشن رخ می‌دهد و به `org.freedesktop.portal.Settings` دست می‌زند؛
+بک‌اند GTK آن سرویس با `cannot open display` می‌میرد و از آن لحظه هر برنامه‌ای که
+از Portal چیزی بخواهد پشت تایم‌اوت ۲۵ ثانیه‌ای D-Bus می‌ماند — تا حدی که باز شدن
+کروم یا ترمینال چند دقیقه طول می‌کشد. عقب انداختن آن تا اولین کپی، این ترتیب را
+غیرقابل‌نقض می‌کند، چون تنها منبع دادهٔ دیمن (اکستنشن شل) فقط وقتی وجود دارد که شل
+بالا باشد.
+
+پنل هم تنبل ساخته می‌شود: تا `Super+Shift+V` نزنی پنجره‌ای وجود ندارد و
+`clipnest list`/`status`/`pick` هیچ‌وقت پنجره نمی‌سازند، پس در محیط بدون نمایشگر هم
+کار می‌کنند.
+
+برای محافظت از خودِ Portal (اختیاری، مستقل از ClipNest):
 
 ```bash
-clipnest setup
-clipnest doctor        # should be all ✅
+make install-portal-guard     # Restart=on-failure + TimeoutStartSec=30 برای سرویس‌های Portal
+make uninstall-portal-guard   # برگشت به حالت اول
 ```
 
-**Log out and back in** — GNOME Shell only loads the extension at session start.
+## نصب
 
-### Fedora / RHEL / openSUSE
+### از بستهٔ `.deb` (پیشنهادی)
+
+بسته را از [آخرین انتشار](https://github.com/imaneliasy549-oss/clipnest/releases/latest)
+بردار (نسخه‌های قبلی در همان تب Releases می‌مانند) و **قبل از بازش کردن، چک‌سام را
+بررسی کن**:
 
 ```bash
-sudo dnf install ./clipnest-0.7.0-1.fc44.x86_64.rpm
+sha256sum --check SHA256SUMS --ignore-missing        # فقط فایل‌هایی که دانلود کرده‌ای
+sudo apt install ./clipnest_<version>-1_amd64.deb    # یا: sudo dpkg -i …
+clipnest setup                                       # یک‌بار برای حساب خودت
+# بعد یک‌بار logout/login، چون gnome-shell کد اکستنشن را فقط در شروع سشن می‌خواند
+clipnest doctor                                      # باید همه‌چیز ✅ باشد
 ```
 
-### Arch / CachyOS
+> چرا چک‌سام: این بسته‌ها امضای GPG ندارند، پس `SHA256SUMS` تنها چیزی است که
+> نشان می‌دهد فایل همان چیزی است که از گیت‌هاب آمده. `apt install` هم برخلاف
+> `dpkg -i` وابستگی‌ها را خودش حل می‌کند.
 
-Use the `PKGBUILD` from the [latest release](https://github.com/imaneliasy549-oss/clipnest/releases/latest).
+بسته فایل‌ها را سیستمی می‌گذارد (`/usr/bin/clipnest`، یونیت کاربری در
+`/usr/lib/systemd/user`، فعال‌سازی D-Bus در `/usr/share/dbus-1/services`، اکستنشن در
+`/usr/share/gnome-shell/extensions`)، پس هیچ‌کاری به‌عنوان root لازم نیست و هر کاربری
+روی ماشین فقط `clipnest setup` می‌زند.
 
-### Portable tarball (any distro)
+`postinst` هم همان دو مرحله را یادآوری می‌کند، چون کارهایی که به حساب کاربر مربوط‌اند
+(فعال‌کردن اکستنشن و ثبت میانبر) را یک اسکریپت root نمی‌تواند برای او انجام دهد.
 
-Download `clipnest-0.7.0-x86_64-linux-gnu.tar.gz` from the release, then `./install.sh`.
+### کدام توزیع‌ها؟
 
-### From source
-
-```bash
-sudo apt install libgtk-4-dev libadwaita-1-dev libsqlite3-dev
-make install
-```
-
----
-
-## Usage
-
-| Action | Key |
-| --- | --- |
-| Open / close the panel | `Super+Shift+V` (same as Win+Shift+V) |
-| Paste an entry | `Enter` or click |
-| Navigate | `↑` `↓` `PageUp` `PageDown` `Home` `End` |
-| Pin / unpin | `Ctrl+P` |
-| Delete | `Delete` |
-| Close | `Esc` |
-| Search | type in the box at the top |
-
-Focus stays in the search box — arrow keys move the selection without leaving it. `Backspace` clears the search, `Delete` removes the selected entry.
-
-### Auto-paste
-
-Clicking an entry both copies it and sends `Ctrl+V` to the window you came from. The first time, GNOME asks for keyboard-control permission:
-
-```bash
-clipnest paste-access      # open the dialog now, wait for the answer
-clipnest doctor            # confirms it's ready
-```
-
-`clipnest setup` triggers this at the end too. Once granted, the token is remembered — no repeated prompts. If the screen is locked, GNOME refuses and ClipNest says so. If the portal isn't available, auto-paste silently falls back to copy-only; nothing breaks.
-
-### CLI
-
-```bash
-clipnest list                    # history (* = pinned, newest first)
-clipnest search docker           # substring search
-clipnest get 12 --out a.txt      # dump one entry to a file
-clipnest pick 1                  # copy entry #1 (no paste)
-clipnest paste 1                 # copy + paste entry #1
-clipnest pin 12 / unpin 12
-clipnest delete 12 / clear / vacuum / stats / status
-clipnest config                  # effective settings + path read
-clipnest doctor                  # full install health check
-```
-
-If the daemon isn't running, `list`, `get` and `stats` read the database read-only and warn.
-
-### Configuration
-
-```bash
-clipnest config
-$EDITOR ~/.config/clipnest/config.ini
-systemctl --user restart clipnest      # daemon reads config only at startup
-```
-
-| Key | Default | What it does |
-| --- | --- | --- |
-| `max_items` | 300 | Non-pinned entries kept |
-| `image_budget_mb` | 128 | Total image budget (oldest evicted first) |
-| `max_text_mb` | 1 | Single text limit (0 = off) |
-| `max_image_mb` | 8 | Single image limit (0 = off) |
-| `panel_limit` | 300 | Panel rows read at once |
-| `poll_interval_ms` | 400 | How often the extension checks the clipboard |
-| `max_age_days` | 0 | Drop unused entries older than this (0 = never) |
-| `paste_key` | `<Control>v` | Auto-paste shortcut; `none` = copy-only |
-
-Pinned entries are exempt from every pruning rule.
-
-The extension asks the daemon for the limits over D-Bus (method `Config`), so raising `max_image_mb` actually takes effect.
-
-### Backup
-
-```bash
-clipnest export ~/clipnest-backup          # folder + index.tsv + one file per entry
-clipnest export ~/b --limit 50 --force     # newest 50, over an existing folder
-clipnest import ~/clipnest-backup          # restore (existing entries merged, not duplicated)
-```
-
-Images keep their original bytes (PNG/JPEG), no re-encoding. Timestamps and pins are restored exactly, so history order is preserved. A directory without `index.tsv` still imports by filename.
-
----
-
-## Supported
-
-| Distro | Status |
-| --- | --- |
-| Ubuntu 24.04+ (GNOME 46+) | ✅ with the `.deb` |
-| Debian 13 trixie (GNOME 48) | ✅ with the `.deb` |
-| Fedora 40+ / openSUSE Tumbleweed | ✅ via RPM spec or tarball |
-| Arch / CachyOS | ✅ via `PKGBUILD` |
-| arm64 (any of the above) | ✅ prebuilt `.deb` and `.rpm` |
-| Ubuntu 22.04 (GNOME 42) | ❌ GNOME 42 predates GTK 4.8; the extension targets GNOME 45+ |
-
-Package dependencies are read from the binary itself (`dpkg-shlibdeps`), not guessed:
+بسته خودش می‌گوید چه چیزی لازم دارد، چون وابستگی‌هایش را `dpkg-shlibdeps` از خودِ
+باینری می‌خواند، نه از یک حدس:
 
 ```
 Depends: libadwaita-1-0 (>= 1.0.1), libc6 (>= 2.39), libglib2.0-0t64 (>= 2.54.0),
          libgraphene-1.0-0 (>= 1.5.4), libgtk-4-1 (>= 4.7.2), libsqlite3-0 (>= 3.5.9)
 ```
 
----
+یعنی هر توزیعی با **glibc ≥ 2.39، GTK ≥ 4.8، libadwaita ≥ 1.0.1 و gnome-shell ≥ 45**:
 
-## Troubleshooting
+| توزیع | وضعیت |
+| --- | --- |
+| Ubuntu 26.04 (GNOME Shell 50) | ✅ رانر CI روی `ubuntu-26.04` کامپایل و تست می‌کند (job `next-ubuntu`) |
+| Ubuntu 24.04 (GNOME 46) | ✅ با همین بسته — کف ساخت |
+| Debian 13 trixie (GNOME 48) | ✅ با همین بسته |
+| Fedora 40+ / openSUSE Tumbleweed | ✅ از تارْبال یا اسپک RPM |
+| Arch / CachyOS | ✅ با `PKGBUILD` از `dist/` |
+| Ubuntu 22.04 (GNOME 42) | ❌ نه به‌خاطر glibc؛ GNOME 42 حتی GTK 4.8 هم ندارد و اکستنشن روی GNOME 45+ نوشته شده |
+| GNOME Shell 45–50 | ✅ اعلام‌شده؛ ۵۰ همان چیزی است که ۲۶.۰۴ دارد و CI رویش تست می‌گیرد |
+| GNOME Shell 51 | ⚠️ **اعلام‌شده ولی روی سشن واقعی تست نشده** — کد از APIهایی استفاده می‌کند که از ۴۵ تغییر نکرده‌اند، ولی این ادعا از روی بررسی کد است نه تست |
+| X11 (GNOME روی X11) | ⚠️ کار می‌کند (گرفتن همچنان از اکستنشن است، پیست خودکار از Portal) ولی مسیر تست‌شده نیست؛ `doctor` هم همین را می‌گوید |
+| دسکتاپ غیر GNOME | ❌ روی Wayland هیچ‌چیز خوانده نمی‌شود؛ اکستنشن به gnome-shell وابسته است |
+| معماری arm64 | ✅ رانر `ubuntu-24.04-arm` گیت‌هاب بستهٔ `arm64` را می‌سازد (لگ اختیاری، چون رانر arm فقط برای مخزن عمومی است) |
 
-Start here:
+دو نکته دربارهٔ اینکه «تست‌شده» یعنی چه: رانرهای CI هیچ سشن GNOME ندارند، پس چیزی که
+آنجا اثبات می‌شود **کامپایل و تست شدن روی کتابخانه‌های آن نسخه** است، نه رفتار روی
+Wayland زنده. رفتار زنده (Portal، پیست، اکستنشن) فقط با یک سشن واقعی آزمایش می‌شود؛
+هر ادعایی در این جدول که چنین آزمایشی ندارد، همان‌جا گفته شده.
+
+> یک باینری ساخته‌شده روی توزیع جدیدتر `glibc` جدیدتر می‌خواهد، پس اگر بسته‌ای برای
+> توزیع قدیمی‌تر می‌خواهی، در `dist/` تارْبال سورس هم هست: `make && make install` روی
+> همان سیستم جواب می‌دهد. ورک‌فلوی انتشار هم همان بسته‌ها را روی چند نسخه/معماری از خود
+> گیت‌هاب می‌سازد تا کسی مجبور به کامپایل دستی نباشد.
+
+### از سورس با `make install`
+
+پیش‌نیازها: Rust، `libgtk-4-dev`، `libadwaita-1-dev`، `libsqlite3-dev`، ابزار
+`gnome-extensions` (در بستهٔ `gnome-shell`).
+
+```bash
+sudo apt install libgtk-4-dev libadwaita-1-dev libsqlite3-dev
+make install
+```
+
+این کار باینری را در `~/.local/bin`، یونیت systemd را در `~/.config/systemd/user`،
+اکستنشن را در `~/.local/share/gnome-shell/extensions` نصب می‌کند، سرویس را برای
+فعال‌سازی خودکار با D-Bus ثبت می‌کند و بعد `clipnest setup` را صدا می‌زند که همان
+اکستنشن/میانبر/سرویس را برای حساب فعلی تمام می‌کند (با `make install BINDING='<Super>v'`
+می‌شود میانبر را همان‌جا عوض کرد). در پایان هم `clipnest doctor` گزارش می‌دهد چه چیزی
+هنوز درست نیست.
+
+> روی Wayland بازکردن دوبارهٔ کد اکستنشن بدون خروج از حساب ممکن نیست؛ یک‌بار
+> **logout/login** کن (یا `Alt+F2` و `r` روی X11). تا آن موقع متن و تصویر جدید
+> ثبت نمی‌شود، چون نسخهٔ قدیمی JS هنوز داخل gnome-shell در حال اجراست.
+
+### نصب کاربری و بستهٔ سیستمی را قاطی نکن
+
+نسخهٔ کاربری روی بسته **سایه می‌اندازد**: هم `~/.local/bin/clipnest` در `$PATH` جلوتر از
+`/usr/bin` است، هم gnome-shell اکستنشن `~/.local/share` را قبل از `/usr/share` می‌خواند.
+نتیجه‌اش این است که بسته سالم به نظر می‌رسد ولی همان نسخهٔ قدیمی اجرا می‌شود.
+`clipnest doctor` این وضعیت را با ⚠️ گزارش می‌کند و راه‌حلش این است:
+
+```bash
+make uninstall     # فقط نسخهٔ کاربری می‌رود؛ تاریخچه و بسته دست‌نخورده می‌مانند
+```
+
+> ⚠️ **هرگز فایل‌های زیر `/usr` را برای این کار پاک نکن** — وقتی بسته نصب است، آنها
+> خودِ بسته‌اند. نسخه‌های ۰.۵ و قبل‌تر برای کپی سیستمی `sudo rm -rf` پیشنهاد می‌کردند؛
+> این نسخه دیگر چنین کاری نمی‌کند.
+
+اگر از قبل بستهٔ بسیار قدیمی (۰.۱، با فایل `clipnest-autostart.desktop`) روی سیستم مانده
+باشد، فقط رکوردش را پاک کن؛ فایل‌هایش از آن معماری باقی نمانده:
+
+```bash
+sudo dpkg --purge clipnest
+```
+
+## استفاده
+
+| کار | راه |
+| --- | --- |
+| باز/بسته کردن پنل | `Super+Shift+V` (روی صفحه‌کلید `Win+Shift+V`) |
+| انتخاب و **پیست** آیتم | `Enter` یا کلیک |
+| فقط کپی (بدون پیست) | `clipnest pick <n>` یا راست‌کلیک → Copy |
+| جابه‌جایی | `↑` / `↓` / `PageUp` / `PageDown` / `Home` / `End` (یا `Tab` / `Shift+Tab`) |
+| پین‌کردن آیتم انتخاب‌شده | `Ctrl+P` یا دکمهٔ پین روی ردیف |
+| حذف آیتم | `Delete` (یا راست‌کلیک → Delete) |
+| بستن | `Esc` |
+| جستجو | همان باکس بالای پنل |
+
+فوکوس همیشه در باکس جستجو می‌ماند، پس بعد از جابه‌جایی با فلش‌ها یا `Tab` هنوز می‌توانی
+تایپ کنی: `Tab` فوکوس را بیرون نمی‌برد، انتخاب را یک ردیف پایین می‌برد و `Shift+Tab` بالا.
+`Backspace` همیشه متن جستجو را پاک می‌کند (نه آیتم تاریخچه)؛ تنها راهی که یک ردیف می‌تواند
+فوکوس بگیرد کلیک موس است و همان‌جا `Backspace` آیتم را حذف می‌کند. حذف عادی با `Delete` است.
+
+## پیست خودکار
+
+انتخاب یک آیتم (کلیک یا `Enter`) هم آن را روی کلیپ‌بورد می‌گذارد و هم میانبر پیست را در
+همان پنجره‌ای که بودی می‌فرستد، پس بدون ترک تایپ ادامه می‌دهی:
+
+```
+پنل مخفی می‌شود  ──►  فوکوس برمی‌گردد  ──►  Portal RemoteDesktop  ──►  Ctrl+V
+```
+
+1. پنل مخفی می‌شود و دیمن هر ۳۰ms می‌پرسد «فوکوس رفت؟» (با سقف ۷۵۰ms، و ۱۲۰ms فرصت
+   اضافه تا کامپوزیتور فوکوس را به پنجرهٔ بعدی بدهد). یک `set_visible(false)` ساده کافی
+   نیست: در فاصلهٔ بسته‌شدن پنجره، کلیدها به پنل در حال خروج می‌رفتند.
+2. دیمن یک سشن از پورتال می‌گیرد: `CreateSession` → `SelectDevices(types=keyboard)` →
+   `Start`. این همان لحظه‌ای است که گنوم می‌پرسد «اجازهٔ کنترل کیبورد؟».
+3. بعد با `NotifyKeyboardKeysym` کلیدها می‌روند: `Control` پایین، `v`، `v` بالا،
+   `Control` بالا — با ۴ms فاصله، چون مودیفایری که هم‌زمان با کلیدش برسد همیشه
+   اول اعمال نمی‌شود.
+
+### یک‌بار اجازه بده
+
+```bash
+clipnest paste-access          # دیالوگ را حالا باز می‌کند و منتظر جواب می‌ماند
+clipnest doctor                # بعدش می‌گوید آماده است یا نه، و اگر نه چرا
+```
+
+`clipnest setup` هم این را در پایان خودش صدا می‌زند، تا اجازه را قبل از اولین کلیک
+گرفته باشی. اگر بک‌اند گنوم توکنی برگرداند (`persist_mode`)، در
+`~/.local/share/clipnest/portal-restore-token` ذخیره می‌شود و سؤال هر بار تکرار
+نمی‌شود؛ اگر توکن ندهد، هر سشن تازه یک سؤال دارد (نه خطا).
+
+### نکته‌ها
+
+- **صفحهٔ قفل:** GNOME تا وقتی lock screen بالاست سشن RemoteDesktop نمی‌دهد و پورتال
+  فقط کد ۲ برمی‌گرداند، بدون توضیح. ClipNest با `org.gnome.ScreenSaver.GetActive` همین
+  را تشخیص می‌دهد و می‌گوید «صفحه قفل است، بازش کن و دوباره امتحان کن»؛ `doctor` هم
+  جداگانه گزارشش می‌کند. در این حالت هیچ چیز از دست نمی‌رود: آیتم روی کلیپ‌بورد هست،
+  و تلاش بعدی سشن تازه می‌سازد.
+- **میانبر دلخواه:** `paste_key` در `config.ini` (پیش‌فرض `<Control>v`). مقدارش با همان
+  دستور زبان میانبرهای گنوم چک می‌شود، و `paste_key = none` پیست را خاموش می‌کند و
+  فقط کپی می‌ماند (توضیح پایین پنل هم همان را نشان می‌دهد).
+- **از خط فرمان:** `clipnest paste <n>` همان کار کلیک را می‌کند. `clipnest pick <n>`
+  عمداً فقط کپی می‌کند — دستوری که ناخواسته در پنجرهٔ فعال تایپ کند غافلگیرکننده است.
+- مجوز پورتال فقط **کیبورد** است (`types=keyboard`): نه تصویر صفحه، نه موس. خود پنل هم
+  همیشه روی `CLIPBOARD` و `PRIMARY` می‌نویسد، پس paste با دکمهٔ وسط موس هم راه دارد.
+- اگر پورتال در دسترس نباشد یا اجازه داده نشود، هیچ چیزی نمی‌شکند: آیتم روی کلیپ‌بورد
+  می‌نشیند و خودت `Ctrl+V` می‌زنی.
+
+### تغییر میانبر
+
+پیش‌فرض همان `Super+Shift+V` است؛ اگر خواستی عوضش کنی:
+
+```bash
+clipnest setup-shortcut --binding '<Super><Shift>c'   # میانبر دلخواه
+clipnest setup-shortcut                               # برگشت به پیش‌فرض
+make install BINDING='<Super>v'                       # همان، سر نصب
+```
+
+اگر میانبر انتخابی با یکی از میانبرهای خود گنوم تعارض داشته باشد، همان لحظه هشدار داده
+می‌شود. مثلاً `<Super>v` را گنوم برای `toggle-message-tray` (لیست اعلان‌ها) گرفته است، پس
+اگر عمداً آن را می‌خواهی باید اول آن یکی را آزاد کنی. `clipnest doctor` هم مقدار واقعی
+ثبت‌شده را چاپ می‌کند، میانبر سفارشی را خراب حساب نمی‌کند و تعارض‌ها را با ⚠️ نشان می‌دهد.
+
+### دستورهای CLI
+
+```bash
+clipnest list                 # تاریخچه (پین‌شده‌ها با * بالای لیست)
+clipnest list --json --limit 20
+clipnest search docker        # فقط آیتم‌های حاوی «docker»
+clipnest search two words     # عبارت چندکلمه‌ای هم جستجو می‌شود
+clipnest list --search docker --limit 10 --json
+clipnest get 12               # متن یک آیتم (برای لوله‌کشی دقیق است)
+clipnest get 12 --out a.txt
+clipnest get 7 --out shot.png # تصویر؛ اگر --out نداشته باشد راهنمایی می‌کند
+clipnest get 7 --raw > s.png  # خروجی خام روی stdout
+clipnest pick 1               # آیتم اول را فقط روی کلیپ‌بورد می‌گذارد (بدون پیست)
+clipnest paste 1              # همان آیتم را می‌گذارد و در پنجرهٔ فعال پیست می‌کند
+clipnest paste-access         # اجازهٔ پیست خودکار را از گنوم می‌پرسد (یک‌بار)
+clipnest paste-reset          # آن اجازه را فراموش می‌کند (تاریخچه دست‌نخورده می‌ماند)
+clipnest pin 12 / unpin 12 / delete 12
+clipnest clear / vacuum / stats / status
+clipnest config               # مقادیر مؤثر + مسیری که خوانده شده
+clipnest doctor               # وضعیت کل نصب + راه‌حل هر ایراد
+clipnest toggle               # همان کار میانبر
+clipnest setup                # تمام‌کردن نصب برای این کاربر (اکستنشن، میانبر، سرویس)
+clipnest setup-shortcut [--binding ACCEL] / remove-shortcut / install-extension
+```
+
+اگر دیمن بالا نباشد، `list`، `get` و `stats` به‌جای خطا مستقیماً از فایل دیتابیس
+می‌خوانند (فقط-خواندنی) و هشدار می‌دهند.
+
+### پاک‌کردن و آزادشدن فضا
+
+حذف فقط ردیف را برنمی‌دارد، فضا را هم پس می‌دهد: بعد از هر حذف، SQLite با
+`auto_vacuum` تدریجی صفحه‌های آزادشده را به سیستم برمی‌گرداند و فایل **کوچک می‌شود**.
+
+```bash
+clipnest delete 42            # entry 42 deleted, freed 1.4 MiB
+clipnest clear                # removed 64 entries, freed 2.4 MiB
+clipnest stats                # database 340 KiB at …
+                              # reclaimable 1.1 MiB (run 'clipnest vacuum')
+clipnest vacuum               # فشرده‌سازی کامل + جمع‌کردن فایل -wal
+```
+
+`vacuum` نیازی به دلیل ندارد ولی وقتی `reclaimable` چشمگیر شد (مثلاً بعد از یک import
+بزرگ) ارزش دارد. `max_items`، `image_budget_mb` و `max_age_days` هم هستند تا تاریخچه
+هرگز از کنترل خارج نشود.
+
+### پشتیبان‌گیری و بازگردانی
+
+```bash
+clipnest export ~/clipnest-backup          # پوشه + index.tsv + یک فایل برای هر آیتم
+clipnest export ~/b --limit 50 --force     # فقط ۵۰ آِیتم تازه، روی پوشهٔ پرشده
+clipnest import ~/clipnest-backup          # برگرداندن (چیزی که هست دست‌نخورده می‌ماند)
+```
+
+- هر آیتم یک فایل است: متن‌ها `000012.txt` و تصاویر `000007.png` (همان بایت‌هایی که
+  کلیپ‌بورد داده بود، بدون کدگذاری مجدد)، و `index.tsv` می‌گوید کدام فایل کدام آیتم
+  است و پین و زمان‌ها چه بودند.
+- `import` زمان‌ها و پین را برمی‌گرداند، پس ترتیب تاریخچه به‌هم نمی‌ریزد، و آیتم‌هایی که
+  از قبل هستند دوباره اضافه نمی‌شوند؛ پس دو بار import کردن یک پشتیبان فقط یک بار
+  نتیجه دارد.
+- پوشه‌ای که `index.tsv` ندارد هم قابل import است (همهٔ فایل‌ها بر اساس نام و محتوا).
+- محدودیت‌های تنظیمات هنگام import هم اعمال می‌شود و هر فایلی که خوانده/دیکد نشود
+  گزارش می‌شود، نه اینکه بی‌صدا رد شود.
+
+## داده‌ها، اجازه‌ها و مهاجرت
+
+هر چیزی که این ابزار نگه می‌دارد در سه فایل است و هیچ‌کدام به هم دست نمی‌زنند:
+
+| فایل | چه چیزی |
+| --- | --- |
+| `~/.local/share/clipnest/history.db` | تاریخچه (متن، تصویر، پین، زمان‌ها) |
+| `~/.config/clipnest/config.ini` | تنظیمات (اختیاری؛ نبودنش یعنی پیش‌فرض‌ها) |
+| `~/.local/share/clipnest/portal-restore-token` | **اجازهٔ** پیست خودکار که گنوم داده |
+
+- **فایل توکن با mode `0600` و پوشه‌اش با `0700` نوشته می‌شود** (نوشتن اتمیک است:
+  ابتدا فایل موقت با همان permission و بعد rename). اگر نسخهٔ قدیمی‌تری آن را باز
+  گذاشته باشد، `clipnest doctor` هشدار می‌دهد و **همان‌جا درستش می‌کند** (بازنویسی با
+  تمیزترین حالت ممکن؛ پیام می‌گوید که شد یا نه).
+- `clipnest paste-reset` فقط توکن را پاک می‌کند، یعنی «فراموش کن اجازه داده بودم»؛
+  تاریخچه فایل دیگری است و دست‌نخورده می‌ماند. این عمداً همین‌طور نوشته شده: پاک‌کردن
+  یک اجازه نباید بتواند تاریخچه را هم با خودش ببرد.
+- **مهاجرت دیتابیس:** اگر فایل تاریخچه از نسخهٔ قدیمی‌تری باشد، قبل از هر تغییری یک
+  کپی کنارش گذاشته می‌شود (`history.pre-v2-migration.db`، جایی که `v2` شمارهٔ
+  schemaیی است که فایل به آن می‌رود) و خودِ مهاجرت داخل **یک
+  تراکنش** انجام می‌شود؛ یا کامل می‌شود یا هیچ‌کدام. اگر نسخهٔ قبلی وسط مهاجرت قطع شده
+  باشد (جدول `items_legacy` باقی مانده)، نسخهٔ جدید داده را از همان جدول برمی‌دارد
+  به‌جای اینکه جدول خالی بسازد.
+- **حذف بسته تاریخچه را پاک نمی‌کند:** نه `apt remove` و نه `make uninstall` به
+  `~/.local/share/clipnest` دست نمی‌زنند. اگر واقعاً می‌خواهی همه‌چیز برود، خودت پاکش کن.
+
+## تنظیمات
+
+از نسخهٔ ۰.۶ هیچ عددی در کد نیست؛ همه‌چیز از یک فایل خوانده می‌شود:
+
+```bash
+clipnest config                 # مقادیر مؤثر، مسیر فایل، و هر خطی که خوانده نشده
+$EDITOR ~/.config/clipnest/config.ini
+systemctl --user restart clipnest   # تا دیمن مقادیر تازه را بخواند
+```
+
+| کلید | پیش‌فرض | کار |
+| --- | --- | --- |
+| `max_items` | ۳۰۰ | چند آیتم غیرپین‌شده نگه داشته شود |
+| `image_budget_mb` | ۱۲۸ | بودجهٔ کل حجم تصاویر غیرپین‌شده؛ قدیمی‌ترها اول می‌روند |
+| `max_text_mb` | ۱ | سقف یک متن (۰ = متن ثبت نشود) |
+| `max_image_mb` | ۸ | سقف یک تصویر (۰ = تصویر ثبت نشود) |
+| `panel_limit` | ۳۰۰ | چند ردیف پنل یک‌بار می‌خواند |
+| `poll_interval_ms` | ۴۰۰ | هر چند میلی‌ثانیه اکستنشن کلیپ‌بورد را ببیند |
+| `max_age_days` | ۰ | آیتم‌های بی‌استفادهٔ قدیمی‌تر از این پاک شوند (۰ = هرگز) |
+| `paste_key` | `<Control>v` | میانبری که پیست خودکار می‌فرستد؛ `none` = فقط کپی |
+
+آیتم پین‌شده از هر سه قاعدهٔ هرس (تعداد، بودجهٔ حجم، سن) معاف است.
+
+نکته‌ها:
+
+- سقف‌ها و بازهٔ poll را **اکستنشن هم از خود دیمن می‌پرسد** (متد `Config` روی D-Bus)،
+  پس اگر عددی را بالا ببری، همان سقف در اکستنشن هم اعمال می‌شود؛ اگر این‌طور نبود،
+  بالا بردن `max_image_mb` بی‌اثر می‌ماند چون اکستنشن تصویر بزرگ را زودتر رد می‌کرد.
+- بعد از تغییر فایل، دیمن را ری‌استارت کن (بالا)؛ اکستنشن هر حدود یک دقیقه هم مقادیر
+  تازه را از دیمن می‌گیرد، ولی دیمن فقط در شروع مقدار‌ها را می‌خواند.
+- میانبر پیش‌فرض `Super+Shift+V` است (`SHORTCUT_BINDING` در `src/install.rs` و `BINDING`
+  در `Makefile`) و بدون کامپایل مجدد قابل تغییر است:
+  `clipnest setup-shortcut --binding '<Super><Shift>c'`
+
+## چرا در نسخهٔ 0.2 هیچ چیزی ثبت نمی‌شد؟
+
+`St.Clipboard` در GJS **هیچ متد `_finish` ای ندارد**؛ `get_text` و `get_content`
+کال‌بک‌محورند:
+
+```js
+clipboard.get_text(St.ClipboardType.CLIPBOARD, (clipboard, text) => { ... });
+clipboard.get_content(St.ClipboardType.CLIPBOARD, 'image/png', (clipboard, bytes) => { ... });
+```
+
+نسخهٔ قبل داخل کال‌بک `get_text_finish` را صدا می‌زد که وجود ندارد؛ استثنا در یک
+`try/catch` خورده می‌شد و بی‌صدا رد می‌شد، پس **هیچ متنی هم ثبت نمی‌شد**. بدتر:
+خواندن تصویر با امضای اشتباه `get_content(type, callback)` انجام می‌شد که باعث
+می‌شد استثنا بیرون بپرد و پرچم `_reading` تا ابد `true` بماند — یعنی با اولین کپی
+تصویر، تمام ثبت تاریخچه تا ریستارت می‌خوابید. حالا هر دو مسیر درست صدا زده می‌شوند و
+خواندن‌ها یک نگهبان ۳ ثانیه‌ای دارند تا یک انتقال معلق، poll را قفل نکند.
+
+تصاویر هم دیگر به‌صورت پیکسل خام RGBA ذخیره نمی‌شوند: همان کدگذاری‌ای که برنامه
+عرضه کرده (PNG/JPEG/…) ذخیره می‌شود و GDK خودش برای نمایش دیکد می‌کند. قبلاً یک
+تصویر ۱۰۲۴×۱۰۲۴ حدود ۴ مگابایت بود؛ الان معمولاً چند صد کیلوبایت. رنگ‌ها هم درست
+شده‌اند (ترتیب کانال R/B دیگر جابه‌جا نمی‌شود).
+
+## عیب‌یابی
+
+اول از همه:
 
 ```bash
 clipnest doctor
 ```
 
-Every line is ✅ / ⚠️ / ❌ with the command that fixes it. The most common cases:
+هر خط ✅/⚠️/❌ است و کنار هر ایراد دستوری هست که باید بزنی. کارهای پرتکرار:
 
-| Symptom | Fix |
+| نشانه | راه‌حل |
 | --- | --- |
-| Nothing is captured | `clipnest status`; if no daemon: `systemctl --user restart clipnest` |
-| New items don't appear (old ones do) | The extension in memory is old — **log out and back in** |
-| Shortcut doesn't work | `clipnest setup-shortcut`; `doctor` flags conflicts with GNOME keys |
-| Panel opens but doesn't take focus | Trigger it from GNOME, not from a terminal, so the activation token is passed |
-| Database is large | `clipnest stats`, then `clipnest vacuum`; lower `image_budget_mb` |
-| Click copies but doesn't paste | `clipnest paste-access`; if it says the screen is locked, unlock first |
-| `doctor` warns a user install shadows the package | `make uninstall` — **never** `rm -rf` under `/usr`, that's the package |
-| `auto-paste: needs permission` | `clipnest paste-access` (once), or set `paste_key = none` to disable |
+| هیچ چیزی ثبت نمی‌شود | `clipnest status`؛ اگر دیمن جواب نداد: `systemctl --user restart clipnest` |
+| تصویر/متن جدید ثبت نمی‌شود ولی قبلی‌ها هستند | اکستنشن قدیمی در حافظه است: logout/login |
+| بعد از `make install` باز هم مشکل | `systemctl --user daemon-reload && systemctl --user restart clipnest` |
+| میانبر کار نمی‌کند | `clipnest setup-shortcut`؛ `clipnest doctor` تعارض با میانبرهای گنوم را با ⚠️ نشان می‌دهد |
+| پنل باز می‌شود ولی فوکوس نمی‌گیرد | میانبر باید از خود گنوم اجرا شود (نه از ترمینال) تا توکن فعال‌سازی پاس شود |
+| حجم دیتابیس زیاد شده | `clipnest stats` و بعد `clipnest vacuum`؛ و `image_budget_mb` را کم کن |
+| `clipnest status` می‌گوید نسخهٔ دیمن قدیمی است | `systemctl --user restart clipnest` |
+| بعد از نصب بسته هیچ کپی ثبت نمی‌شود | `clipnest setup` را زده‌ای؟ بعدش یک‌بار logout/login لازم است |
+| `clipnest doctor` می‌گوید یونیت را مدیر کاربر نمی‌شناسد | `systemctl --user daemon-reload` (خودِ `clipnest setup` این کار را می‌کند) |
+| `doctor` هشدار می‌دهد یک نسخهٔ کاربری سایه انداخته | `make uninstall` (فایل‌های `/usr` را دست نزن، آن‌ها خودِ بسته‌اند) |
+| تنظیمات اثر نمی‌کند | `clipnest config` برای دیدن مقادیر مؤثر، بعد `systemctl --user restart clipnest` |
+| کلیک روی آیتم فقط کپی می‌کند و پیست نمی‌کند | `clipnest paste-access`؛ اگر پیام گفت صفحه قفل است، اول قفل را باز کن |
+| `doctor` می‌گوید `auto-paste: needs permission` | `clipnest paste-access` (یک‌بار) — یا `paste_key = none` بگذار تا خاموش شود |
+| `paste_key` را عوض کردم ولی بی‌اثر بود | `systemctl --user restart clipnest` (دیمن تنظیمات را در شروع می‌خواند) |
 
-Full table in [`TROUBLESHOOTING.md`](TROUBLESHOOTING.md).
+نکته‌ها:
 
-### Uninstall
+- تا وقتی دیمن در حال اجراست، **کلیپ‌بورد در اختیار آن است**؛ با ریستارت دیمن، محتوای
+  کلیپ‌بورد پاک می‌شود (فقط خود کلیپ‌بورد، نه تاریخچه).
+- آیتم انتخاب‌شده هم روی `CLIPBOARD` می‌رود و هم روی `PRIMARY`، پس paste معمولی و
+  paste با دکمهٔ وسط موس هر دو همان آیتم را می‌دهند.
+- پیست خودکار روی Wayland از `org.freedesktop.portal.RemoteDesktop` استفاده می‌کند
+  (پایین توضیح داده شده). بدون آن — اگر پورتال در دسترس نباشد یا اجازه داده نشده
+  باشد — همه‌چیز مثل قبل کار می‌کند: آیتم روی کلیپ‌بورد می‌نشیند و خودت `Ctrl+V` می‌زنی.
+- می‌خواهی همه‌چیز را پاک کنی؟
+  - نصب کاربری: `make uninstall` (میانبر، اکستنشن، سرویس و باینری را برمی‌دارد).
+  - بستهٔ سیستمی: `clipnest remove-shortcut && gnome-extensions disable clipnest@clipnest.dev && sudo dpkg -r clipnest`
+  - تاریخچه هم جای خودش می‌ماند: `~/.local/share/clipnest/history.db`.
+- `.deb` را اول با `make deb-verify` بازرسی کن؛ اگر خودت روی همین سیستم نصبش کردی،
+  قبلش `make uninstall` بزن تا نسخهٔ کاربری رویش سایه نیندازد.
 
-```bash
-# user install only
-make uninstall
+## ساختار
 
-# system package
-clipnest remove-shortcut
-gnome-extensions disable clipnest@clipnest.dev
-sudo dpkg -r clipnest
-
-# history (kept on purpose across installs)
-rm -rf ~/.local/share/clipnest
+```
+src/main.rs                 CLI، کلاینت D-Bus و doctor
+src/app.rs                  دیمن، پنل GTK4، سرویس D-Bus، کش بندانگشتی‌ها
+src/db.rs                   تاریخچه روی SQLite (متن، تصویر کدشده، پین، هرس، مهاجرت، آزادسازی فضا)
+src/config.rs               خواندن ~/.config/clipnest/config.ini
+src/install.rs              مسیرهای نصب (کاربری/بسته‌ای)، اکستنشن، میانبر، `setup`
+src/paste.rs                پیست خودکار: کلاینت `org.freedesktop.portal.RemoteDesktop`
+src/backup.rs               export/import پوشه‌ای
+extension/extension.js      خواندن کلیپ‌بورد از داخل gnome-shell + گرفتن تنظیمات از دیمن
+extension/lib/clipboard.js  تصمیم‌ها بدون GNOME (fingerprint تصویر، سقف‌ها، timeout) — قابل تست
+extension/tests/units.js    ۳۲ تست همان منطق با gjs یا node
+packaging/tests/install-smoke.sh  بازرسی بسته و نصب واقعی
+ROADMAP.md                  کارهای بعدی، با اولویت و دلیل
+data/clipnest.service        یونیت systemd کاربری (make install)
+data/deb/…                  یونیت و فعال‌سازی D-Bus مخصوص بسته
+data/clipnest.desktop، data/icons/…   شناسهٔ برنامهٔ پنل برای gnome-shell
+debian/postinst             یادآوری دو مرحلهٔ کاربری بعد از نصب بسته
+packaging/                  اسپک RPM، `PKGBUILD` آرچ، نصب‌کنندهٔ تارْبال
+dist/                       خروجی `make dist` (بسته‌ها و تارْبال‌ها)
+.github/workflows/          CI (make check) و انتشار چند-توزیعی با تگ
+RELEASING.md                از `git init` تا تگ و انتشار
+CHANGELOG.md                تغییرات نسخه‌ها
 ```
 
-Never mix the two install methods. A user install shadows the package (`~/.local/bin` precedes `/usr/bin`, and GNOME Shell reads `~/.local/share/gnome-shell/extensions` first) — `clipnest doctor` reports this.
-
----
-
-## Development
+## توسعه
 
 ```bash
-make check        # clippy -D warnings + 64 tests
-make deb          # build .deb in target/debian/
-make deb-verify   # inspect the package without installing
-make dist         # build dist/ — .deb, tarballs, RPM spec, PKGBUILD, SHA256SUMS
-make dist-verify  # verify artifacts and their checksums
-make preflight    # pre-publish checks (git identity, stale dist/, leftover placeholders)
+make bootstrap    # پیش‌نیازها را *بررسی* می‌کند و می‌گوید چه کم است (چیزی نصب نمی‌کند)
+make check        # clippy با -D warnings + تست‌های Rust + تست‌های JavaScript اکستنشن
+make test-extension  # فقط تست‌های اکستنشن (با gjs، یا node اگر gjs نبود)
+make deb          # ساخت بستهٔ .deb در target/debian/
+make deb-verify   # بازرسی بسته بدون نصب: متادیتا، فهرست فایل‌ها، اجرای باینری بسته
+make dist         # پوشهٔ dist/ — .deb، تارْبال قابل‌حمل، تارْبال سورس، اسپک RPM، PKGBUILD، SHA256SUMS
+make dist-verify  # بازرسی همین خروجی: sha256، این‌که هر فایلی که recipes نام می‌برند واقعاً در تارْبال هست، و Depends بسته
+make preflight    # پیش از انتشار: هویت git، USERNAME باقی‌مانده، و کهنه‌بودن dist/ (فقط می‌خواند)
 ```
 
-Portal tests open a permission dialog, so they're ignored by default:
+پوشهٔ `.deb` در `dist/` به نام **کفِ پشتیبانی** است نه نام این سیستم: کف از خود بسته خوانده
+می‌شود (`libc6 (>= 2.39)` یعنی اوبونتو ۲۴.۰۴)، پس بسته‌ای که روی ۲۶.۰۴ ساخته می‌شود در
+`dist/ubuntu-24.04-amd64/` می‌نشیند — جایی که واقعاً نصب می‌شود. `dist/ubuntu-22.04-amd64/`
+هم وجود دارد، ولی فقط برای این‌که بگوید چرا چنین بسته‌ای ممکن نیست.
+
+تست‌ها بدون نیاز به GTK/دیتابیس واقعی اجرا می‌شوند (SQLite در حافظه) و مهاجرت
+(از جمله مهاجرتِ نیمه‌کاره)، پین، هرس، آزادسازی فضا، رفت‌وبرگشت تصویر و پشتیبان‌گیری،
+پارسر CLI، اعتبارسنجی JSON، اجازهٔ فایل توکن، مسیرهای خطرناک در import، پارسر تنظیمات،
+سیاست eviction کش بندانگشتی، اعتبارسنجی میانبر، تشخیص سشن (Wayland/X11/دسکتاپ دیگر) و
+هم‌خوانی فایل‌های بسته با کد را پوشش می‌دهند.
+
+**تست‌های اکستنشن جدا هستند و با gjs اجرا می‌شوند** (همان موتوری که در سشن اجرا
+می‌کند) - منطق تصمیم‌گیری در `extension/lib/clipboard.js` بدون حتی یک import از GNOME
+نوشته شده تا قابل تست باشد:
+
+```bash
+gjs -m extension/tests/units.js      # یا: make test-extension
+```
+
+تست دست‌دادن با Portal دیالوگ باز می‌کند، پس در حالت عادی اجرا نمی‌شود؛ با یک سشن
+واقعی (بدون باز کردن دیالوگ، فقط `CreateSession`/`SelectDevices`):
 
 ```bash
 cargo test --offline -- --ignored --nocapture
 ```
 
-See [`ARCHITECTURE.md`](ARCHITECTURE.md) for how the extension, daemon and portal fit together, and [`RELEASING.md`](RELEASING.md) for the release process.
+و برای آزمایش یک بستهٔ ساخته‌شده بدون دست‌زدن به نصب فعلی:
 
----
+```bash
+bash packaging/tests/install-smoke.sh dist/ubuntu-24.04-amd64/clipnest_*.deb
+sudo bash packaging/tests/install-smoke.sh --install dist/ubuntu-*/clipnest_*.deb
+```
 
-## License
+این اسکریپت متادیتای بسته، فهرست فایل‌ها، **یکسان‌بودن فایل‌های اکستنشن داخل بسته با
+مخزن** (که اگرنه اکستنشن قدیمی روی باینری جدید سایه می‌اندازد) و در حالت root نصب واقعی
+با `apt` را بررسی می‌کند.
 
-MIT — see [`LICENSE`](LICENSE).
+> `cargo fmt --all -- --check` هم بخشی از CI است، ولی در jobی که عمداً غیر-blocking
+> است: پروژه روی ماشینی توسعه داده شده که `rustfmt` نداشت، پس این بررسی تا وقتی یک
+> بار `cargo fmt --all` روی ماشینی با rustfmt اجرا نشود، گزارش است نه حکم.
+
+خروجی بالا همان چیزی است که workflowهای CI هم می‌زنند (`make check` روی ۲۴.۰۴ و
+۲۶.۰۴، به‌علاوهٔ jobی که همان بستهٔ ساخته‌شده روی ۲۴.۰۴ را روی ۲۶.۰۴ نصب و اجرا می‌کند).
+
+### انتشار روی گیت‌هاب
+
+گام‌به‌گام در `RELEASING.md` آمده: اولین `git init`/commit/push، تنظیم هویت git و
+توکن/کلید (اگر روی این ماشین هیچ‌وقت گیت استفاده نشده باشد، اولین کامیت بدون آن
+شکست می‌خورد و push نام کاربری و توکن می‌پرسد)، جای‌گذاشتن نام کاربری در
+`Cargo.toml` با `make set-github GH=<account>`، ساخت تگ، و این‌که ورک‌فلوی
+`Release` چه چیزی می‌سازد و به انتشار می‌چسباند (`.deb` برای amd64 و arm64، `.rpm`،
+تارْبال‌ها و `SHA256SUMS`). پیش از هر push یک بار `make preflight` بزن: همان
+چیزهایی را می‌گیرد که فقط بعد از آپلود معلوم می‌شوند.
+
+بستهٔ نصب داخل درخت مخزن نمی‌آید: `/dist` در `.gitignore` است و فایل‌ها در تب
+**Releases** همان تگ می‌نشینند (تاریخچهٔ گیت برای باینری حجیم ساخته نشده).

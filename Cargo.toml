@@ -1,6 +1,6 @@
 [package]
 name = "clipnest"
-version = "0.7.0"
+version = "0.8.0"
 edition = "2021"
 description = "Minimal keyboard-driven clipboard history for GNOME on Wayland"
 license = "MIT"
@@ -22,6 +22,13 @@ glib = "0.21"
 gio = "0.21"
 rusqlite = "0.32"
 sha2 = "0.10"
+
+[dev-dependencies]
+# `clipnest list --json` writes its output by hand, so the tests read it back
+# with a real JSON parser: comparing strings cannot tell valid JSON from
+# something that merely looks like it, which is how an escaping bug survives a
+# green test suite.
+serde_json = "1"
 
 [profile.release]
 opt-level = "s"
@@ -69,6 +76,7 @@ assets = [
     ["data/deb/dev.clipnest.Daemon.service", "usr/share/dbus-1/services/", "644"],
     ["extension/metadata.json", "usr/share/gnome-shell/extensions/clipnest@clipnest.dev/", "644"],
     ["extension/extension.js", "usr/share/gnome-shell/extensions/clipnest@clipnest.dev/", "644"],
+    ["extension/lib/clipboard.js", "usr/share/gnome-shell/extensions/clipnest@clipnest.dev/lib/", "644"],
     ["data/clipnest.desktop", "usr/share/applications/", "644"],
     ["data/icons/hicolor/scalable/apps/dev.clipnest.Panel.svg", "usr/share/icons/hicolor/scalable/apps/", "644"],
     ["README.md", "usr/share/doc/clipnest/", "644"],

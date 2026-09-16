@@ -141,10 +141,9 @@ impl Store {
         if let Some(dir) = path.parent() {
             let _ = std::fs::create_dir_all(dir);
         }
-        let mut store = Self::from_conn(Connection::open(path)?)?;
-        store.config = config;
-        store.path = Some(path.to_path_buf());
-        Ok(store)
+        // The path is handed to the migration so it can put a copy of the old
+        // file next to the new one before it starts changing it.
+        Self::from_conn_at(Connection::open(path)?, config, path)
     }
 
     /// The settings in force.
@@ -190,11 +189,27 @@ impl Store {
     }
 
     /// Wraps an existing connection (an in-memory one, in the tests).
+    ///
+    /// Only the tests ever bring their own connection - in production the file
+    /// is opened through `open_at`, which is also the only path that can hand a
+    /// path to the migration for its pre-upgrade copy.
+    #[cfg(test)]
     pub(crate) fn from_conn(conn: Connection) -> rusqlite::Result<Self> {
         Self::from_conn_with(conn, Config::default())
     }
 
+    #[cfg(test)]
     pub(crate) fn from_conn_with(conn: Connection, config: Config) -> rusqlite::Result<Self> {
+        Self::from_conn_at(conn, config, Path::new(""))
+    }
+
+    /// The one constructor that opens a real file, and therefore the only one
+    /// that can be asked to back it up before a migration rewrites it.
+    pub(crate) fn from_conn_at(
+        conn: Connection,
+        config: Config,
+        path: &Path,
+    ) -> rusqlite::Result<Self> {
         conn.execute_batch(
             // `busy_timeout` is what keeps a read running while the daemon is
             // writing: without it the two collide instantly and SQLite answers
@@ -204,7 +219,7 @@ impl Store {
              PRAGMA auto_vacuum=INCREMENTAL;
              PRAGMA busy_timeout=5000;",
         )?;
-        migrate(&conn)?;
+        migrate(&conn, if path.as_os_str().is_empty() { None } else { Some(path) })?;
         Ok(Self {
             conn,
             config,
@@ -579,29 +594,80 @@ impl Store {
 /// `clipboard_items` table. Both are folded into the new table, and raw-pixel
 /// rows are dropped (they were only ever written by a code path that could not
 /// run).
-fn migrate(conn: &Connection) -> rusqlite::Result<()> {
+fn migrate(conn: &Connection, path: Option<&Path>) -> rusqlite::Result<()> {
     let version: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
     if version >= SCHEMA_VERSION {
         conn.execute_batch(CREATE_ITEMS)?;
         return Ok(());
     }
 
-    if table_exists(conn, "items")? {
+    // A copy of the old file first, so a migration that goes wrong costs a
+    // backup instead of a history. Only worth doing when there is something to
+    // lose: a brand-new database has no rows to preserve.
+    if let Some(path) = path {
+        if stranded_rows(conn)? > 0 {
+            match back_up(conn, path) {
+                Ok(target) => eprintln!(
+                    "clipnest: upgrading the history database; a copy of the old \
+                     file is kept at {}",
+                    target.display()
+                ),
+                Err(err) => eprintln!(
+                    "clipnest: cannot write a backup before upgrading the history ({err}); \
+                     continuing anyway"
+                ),
+            }
+        }
+    }
+
+    // One transaction around all of it. These used to be separate statements,
+    // which left a window no reader would ever see but a crash would: between
+    // renaming `items` away and copying its rows back, the next run found no
+    // `items` table to migrate and cheerfully created an empty one, and the
+    // history was gone with the old table's name.
+    conn.execute_batch("BEGIN IMMEDIATE;")?;
+    match migration_steps(conn) {
+        Ok(()) => conn.execute_batch("COMMIT;")?,
+        Err(err) => {
+            // Losing the migration is fine; a half-migrated file is not.
+            let _ = conn.execute_batch("ROLLBACK;");
+            return Err(err);
+        }
+    }
+    // Converting an existing file to incremental auto-vacuum needs a rebuild.
+    // `VACUUM` may not run inside a transaction, which is why it is out here.
+    conn.execute_batch("VACUUM")?;
+    Ok(())
+}
+
+/// The renames, copies and drops a migration is made of, in the order they have
+/// to happen. Each step is written so that running it twice changes nothing,
+/// because the whole point is to survive being interrupted.
+fn migration_steps(conn: &Connection) -> rusqlite::Result<()> {
+    // v0.2 stored images as raw pixels; that column is what tells the two
+    // layouts apart. `items_legacy` not existing is part of the test so a second
+    // run cannot rename the new table over the old one.
+    if table_exists(conn, "items")? && !table_exists(conn, "items_legacy")? {
         let columns = table_columns(conn, "items")?;
         if columns.iter().any(|name| name == "pixels") {
             conn.execute_batch("ALTER TABLE items RENAME TO items_legacy;")?;
-            conn.execute_batch(CREATE_ITEMS)?;
-            conn.execute_batch(&format!(
-                "INSERT OR IGNORE INTO items
-                     (kind, text, width, height, hash, pinned, created_at, last_used_at)
-                 SELECT kind, text, width, height, hash, 0, {created}, {used}
-                 FROM items_legacy WHERE kind = 'text' AND text IS NOT NULL;
-                 DROP TABLE items_legacy;
-                 DROP INDEX IF EXISTS idx_items_last_used;",
-                created = millis_from_legacy("created_at"),
-                used = millis_from_legacy("last_used_at"),
-            ))?;
         }
+    }
+
+    // Present either because step one just renamed it, or because an earlier
+    // version was interrupted before it finished: the text rows are carried over
+    // either way instead of being left behind under a name nothing reads.
+    if table_exists(conn, "items_legacy")? {
+        conn.execute_batch(CREATE_ITEMS)?;
+        conn.execute_batch(&format!(
+            "INSERT OR IGNORE INTO items
+                 (kind, text, width, height, hash, pinned, created_at, last_used_at)
+             SELECT kind, text, width, height, hash, 0, {created}, {used}
+             FROM items_legacy WHERE kind = 'text' AND text IS NOT NULL;",
+            created = millis_from_legacy("created_at"),
+            used = millis_from_legacy("last_used_at"),
+        ))?;
+        conn.execute_batch("DROP TABLE items_legacy; DROP INDEX IF EXISTS idx_items_last_used;")?;
     }
 
     if table_exists(conn, "clipboard_items")? {
@@ -609,25 +675,65 @@ fn migrate(conn: &Connection) -> rusqlite::Result<()> {
         let usable = ["content", "content_hash", "pinned", "created_at", "last_used_at"]
             .iter()
             .all(|needed| columns.iter().any(|name| name == needed));
+        // A table whose columns we cannot read is left exactly as it is: this
+        // build cannot interpret it, and dropping it would be throwing away
+        // something a future version might understand.
         if usable {
             conn.execute_batch(CREATE_ITEMS)?;
             conn.execute_batch(&format!(
                 "INSERT OR IGNORE INTO items
                      (kind, text, hash, pinned, created_at, last_used_at)
                  SELECT 'text', content, content_hash, pinned, {created}, {used}
-                 FROM clipboard_items WHERE content IS NOT NULL;
-                 DROP TABLE clipboard_items;",
+                 FROM clipboard_items WHERE content IS NOT NULL;",
                 created = millis_from_legacy("created_at"),
                 used = millis_from_legacy("last_used_at"),
             ))?;
+            conn.execute_batch("DROP TABLE clipboard_items;")?;
         }
     }
 
     conn.execute_batch(CREATE_ITEMS)?;
     conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
-    // Converting an existing file to incremental auto-vacuum needs a rebuild.
-    conn.execute_batch("VACUUM")?;
     Ok(())
+}
+
+/// Where the copy taken before a migration lives: right next to the database, so
+/// whoever finds one file finds the other.
+pub fn migration_backup_path(path: &Path) -> PathBuf {
+    let stem = path
+        .file_stem()
+        .map(|name| name.to_string_lossy().to_string())
+        .unwrap_or_else(|| "history".to_string());
+    let dir = path.parent().unwrap_or_else(|| Path::new("."));
+    dir.join(format!("{stem}.pre-v{SCHEMA_VERSION}-migration.db"))
+}
+
+/// Copies the database through SQLite's own `VACUUM INTO`, which sees the
+/// write-ahead log as well as the main file - a plain file copy would miss
+/// whatever the daemon had written but not yet checkpointed.
+fn back_up(conn: &Connection, path: &Path) -> rusqlite::Result<PathBuf> {
+    let target = migration_backup_path(path);
+    if target.exists() {
+        // Keep the first one: it is the oldest state, taken before any of this
+        // touched the file.
+        return Ok(target);
+    }
+    conn.execute("VACUUM INTO ?1", params![target.to_string_lossy()])?;
+    Ok(target)
+}
+
+/// How many rows sit in tables this build would migrate. Zero means there is
+/// nothing to lose and no backup to take.
+fn stranded_rows(conn: &Connection) -> rusqlite::Result<i64> {
+    let mut total = 0;
+    for table in ["items", "items_legacy", "clipboard_items"] {
+        if table_exists(conn, table)? {
+            total += conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                row.get::<_, i64>(0)
+            })?;
+        }
+    }
+    Ok(total)
 }
 
 /// Earlier versions counted in whole seconds. Values that look like seconds are
@@ -1119,5 +1225,226 @@ mod tests {
         let ancient = items.iter().find(|item| item.preview() == "ancient").unwrap();
         assert_eq!(ancient.created_at, 5_000);
         assert!(ancient.pinned);
+    }
+
+    /// An upgrade that was interrupted after the old table had been renamed away
+    /// but before its rows were copied back. That used to be data loss: the next
+    /// run looked for `items`, found nothing to migrate, and started empty.
+    #[test]
+    fn finishes_a_migration_that_was_interrupted() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE items_legacy (
+                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                 kind TEXT NOT NULL, text TEXT, width INTEGER NOT NULL DEFAULT 0,
+                 height INTEGER NOT NULL DEFAULT 0,
+                 hash TEXT NOT NULL UNIQUE, created_at INTEGER NOT NULL,
+                 last_used_at INTEGER NOT NULL
+             );
+             INSERT INTO items_legacy (kind, text, hash, created_at, last_used_at)
+             VALUES ('text', 'from the interrupted run', 'h1', 10, 10);",
+        )
+        .unwrap();
+        // No `items` table at all, and no version: exactly what the crash left.
+
+        let store = Store::from_conn(conn).unwrap();
+        assert_eq!(store.schema_version(), SCHEMA_VERSION);
+        let previews: Vec<String> = store
+            .list("", 10)
+            .unwrap()
+            .iter()
+            .map(Item::preview)
+            .collect();
+        assert_eq!(previews, vec!["from the interrupted run".to_string()]);
+    }
+
+    #[test]
+    fn migrating_twice_changes_nothing() {
+        // The daemon opens the database on every start and the CLI on every
+        // command, so "already migrated" is the common case, not the rare one.
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE items (
+                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                 kind TEXT NOT NULL, text TEXT, width INTEGER NOT NULL DEFAULT 0,
+                 height INTEGER NOT NULL DEFAULT 0, stride INTEGER NOT NULL DEFAULT 0,
+                 pixels BLOB, hash TEXT NOT NULL UNIQUE, created_at INTEGER NOT NULL,
+                 last_used_at INTEGER NOT NULL
+             );
+             INSERT INTO items (kind, text, hash, created_at, last_used_at)
+             VALUES ('text', 'once', 'h1', 10, 10);",
+        )
+        .unwrap();
+
+        let store = Store::from_conn(conn).unwrap();
+        let after_first = store.list("", 10).unwrap().len();
+        // The same connection, migrated again by hand.
+        migrate(&store.conn, None).unwrap();
+        assert_eq!(store.list("", 10).unwrap().len(), after_first);
+        assert_eq!(after_first, 1);
+        assert_eq!(store.schema_version(), SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn a_legacy_table_this_build_cannot_read_is_left_alone() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE clipboard_items (something_else TEXT);
+             INSERT INTO clipboard_items VALUES ('do not touch');",
+        )
+        .unwrap();
+        let store = Store::from_conn(conn).unwrap();
+        assert!(table_exists(&store.conn, "clipboard_items").unwrap());
+        // And the columns are still what they were, not an empty table of ours.
+        assert_eq!(
+            table_columns(&store.conn, "clipboard_items").unwrap(),
+            vec!["something_else".to_string()]
+        );
+        assert_eq!(store.schema_version(), SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn a_file_that_is_not_a_database_is_an_error_not_a_panic() {
+        let path = temp_path("not-a-database");
+        std::fs::write(&path, b"this is not a SQLite file, not even close").unwrap();
+        let result = Store::open_at(&path, Config::default());
+        assert!(result.is_err(), "a garbage file should be refused");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_migration_keeps_a_copy_of_the_old_file() {
+        // The promise the backup makes: after an upgrade, the pre-upgrade rows
+        // are still readable in a file the user can point any tool at.
+        let path = temp_path("migration-backup");
+        let _ = std::fs::remove_file(migration_backup_path(&path));
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE clipboard_items (
+                     id INTEGER PRIMARY KEY AUTOINCREMENT, content TEXT NOT NULL,
+                     content_hash TEXT NOT NULL UNIQUE, created_at INTEGER NOT NULL,
+                     last_used_at INTEGER NOT NULL, pinned INTEGER NOT NULL DEFAULT 0
+                 );
+                 INSERT INTO clipboard_items (content, content_hash, created_at, last_used_at)
+                 VALUES ('before the upgrade', 'h1', 1, 1);",
+            )
+            .unwrap();
+        }
+
+        let store = Store::open_at(&path, Config::default()).unwrap();
+        assert_eq!(store.schema_version(), SCHEMA_VERSION);
+        let previews: Vec<String> = store
+            .list("", 10)
+            .unwrap()
+            .iter()
+            .map(Item::preview)
+            .collect();
+        assert_eq!(previews, vec!["before the upgrade".to_string()]);
+
+        let backup = migration_backup_path(&path);
+        assert!(backup.is_file(), "no backup was written to {backup:?}");
+        // Read it back through SQLite, the only reader that can be trusted to
+        // say whether the copy is a working database rather than a copy of one.
+        let old = Connection::open_with_flags(
+            &backup,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .unwrap();
+        let text: String = old
+            .query_row("SELECT content FROM clipboard_items", [], |row| row.get(0))
+            .expect("the backup should still hold the pre-upgrade table");
+        assert_eq!(text, "before the upgrade");
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&backup);
+    }
+
+    /// A database file of our own, per test, so nothing here can touch the real
+    /// history.
+    fn temp_path(label: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "clipnest-db-{}-{}-{}",
+            label,
+            std::process::id(),
+            now_ms()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir.join("history.db")
+    }
+
+    /// The limits are one promise each, and they all end in a `DELETE`. These
+    /// are the cases where deleting the wrong row costs something a user cannot
+    /// get back.
+    #[test]
+    fn trimming_never_takes_a_pinned_entry() {
+        let config = Config {
+            max_items: 2,
+            max_age_days: 1,
+            ..Config::default()
+        };
+        let store =
+            Store::from_conn_with(Connection::open_in_memory().unwrap(), config).unwrap();
+
+        store.push(&Content::Text("pinned".into())).unwrap();
+        let pinned_id = store.list("", 1).unwrap()[0].id;
+        store.set_pinned(pinned_id, true).unwrap();
+        // Both limits now want this row gone: it is the oldest by far, and the
+        // history is over its item count.
+        store
+            .conn
+            .execute(
+                "UPDATE items SET last_used_at = ?1",
+                params![now_ms() - 400 * 86_400_000],
+            )
+            .unwrap();
+        for text in ["a", "b", "c", "d"] {
+            store.push(&Content::Text(text.into())).unwrap();
+        }
+
+        let previews: Vec<String> = store
+            .list("", 10)
+            .unwrap()
+            .iter()
+            .map(Item::preview)
+            .collect();
+        assert!(
+            previews.contains(&"pinned".to_string()),
+            "a pinned entry was trimmed away: {previews:?}"
+        );
+        assert_eq!(
+            previews.len(),
+            3,
+            "the item limit should leave the pinned row plus two: {previews:?}"
+        );
+    }
+
+    #[test]
+    fn an_image_budget_of_zero_keeps_the_text() {
+        // Documented behaviour: zero means "do not keep images", not "do not
+        // keep anything".
+        let config = Config {
+            image_budget_bytes: 0,
+            ..Config::default()
+        };
+        let store =
+            Store::from_conn_with(Connection::open_in_memory().unwrap(), config).unwrap();
+        store.push(&Content::Text("kept".into())).unwrap();
+        store
+            .push(&Content::Image {
+                mime: "image/png".into(),
+                data: vec![0u8; 64],
+                width: 1,
+                height: 1,
+            })
+            .unwrap();
+        store.trim_now().unwrap();
+        let previews: Vec<String> = store
+            .list("", 10)
+            .unwrap()
+            .iter()
+            .map(Item::preview)
+            .collect();
+        assert_eq!(previews, vec!["kept".to_string()]);
     }
 }

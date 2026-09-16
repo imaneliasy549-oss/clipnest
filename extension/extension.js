@@ -4,6 +4,19 @@ import St from 'gi://St';
 
 import {Extension} from 'resource:///org/gnome/shell/extensions/extension.js';
 
+// The decisions themselves live in `./lib/clipboard.js`, without a single GNOME
+// import, so they can be tested outside the shell. What is left here is the part
+// that genuinely needs gnome-shell: the clipboard object, the timer and D-Bus.
+import {
+    applyConfig,
+    imageKey,
+    pickImageMimetype,
+    readStalled,
+    textKey,
+    toByteArray,
+    withinLimit,
+} from './lib/clipboard.js';
+
 const BUS_NAME = 'dev.clipnest.Daemon';
 const OBJECT_PATH = '/dev/clipnest/Daemon';
 const INTERFACE = 'dev.clipnest.Daemon';
@@ -12,8 +25,6 @@ const POLL_INTERVAL_MS = 400;
 const READ_TIMEOUT_MS = 3000;
 const MAX_TEXT_BYTES = 1024 * 1024;
 const MAX_IMAGE_BYTES = 8 * 1024 * 1024;
-/** How much of an image is fingerprinted to notice a repeat cheaply. */
-const FINGERPRINT_BYTES = 64 * 1024;
 /**
  * The two sizes above are fallbacks: they are the daemon's own defaults, and
  * they are only used until the daemon answers. The real numbers come from the
@@ -60,12 +71,18 @@ export default class ClipNestExtension extends Extension {
         this._reading = false;
         this._readStartedAt = 0;
         this._warnedDaemon = false;
-        this._warnedImage = false;
-        this._maxTextBytes = MAX_TEXT_BYTES;
-        this._maxImageBytes = MAX_IMAGE_BYTES;
-        this._pollIntervalMs = POLL_INTERVAL_MS;
+        this._enabled = true;
+        // The fallbacks are the daemon's own defaults; the real numbers arrive
+        // through `_loadConfig`. They live in one object now so the pure
+        // `applyConfig` can update them as a whole.
+        this._settings = {
+            maxTextBytes: MAX_TEXT_BYTES,
+            maxImageBytes: MAX_IMAGE_BYTES,
+            maxItems: 0,
+            pollIntervalMs: POLL_INTERVAL_MS,
+            loaded: false,
+        };
         this._configTicks = 0;
-        this._configLoaded = false;
         this._armTimer();
         // The daemon is started by the first copy, so at login it may well not be
         // there yet; `_poll` keeps asking until it answers.
@@ -77,7 +94,7 @@ export default class ClipNestExtension extends Extension {
             GLib.source_remove(this._timerId);
         this._timerId = GLib.timeout_add(
             GLib.PRIORITY_DEFAULT,
-            this._pollIntervalMs,
+            this._settings.pollIntervalMs,
             () => {
                 this._poll();
                 return GLib.SOURCE_CONTINUE;
@@ -85,6 +102,9 @@ export default class ClipNestExtension extends Extension {
     }
 
     disable() {
+        // A read already in flight will still call back; the nulls below are why
+        // every callback checks `this._enabled` before touching anything.
+        this._enabled = false;
         if (this._timerId) {
             GLib.source_remove(this._timerId);
             this._timerId = 0;
@@ -93,7 +113,7 @@ export default class ClipNestExtension extends Extension {
         this._bus = null;
         this._lastKey = null;
         this._reading = false;
-        this._configLoaded = false;
+        this._settings.loaded = false;
     }
 
     /**
@@ -102,14 +122,14 @@ export default class ClipNestExtension extends Extension {
      * whatever is missing keeps its fallback.
      */
     _loadConfig() {
-        if (!this._bus)
+        if (!this._bus || !this._enabled)
             return;
         try {
             this._bus.call(
                 BUS_NAME, OBJECT_PATH, INTERFACE, 'Config', null, null,
                 Gio.DBusCallFlags.NONE, 2000, null,
                 (connection, result) => {
-                    if (!this._bus)
+                    if (!this._bus || !this._enabled)
                         return;
                     let pairs;
                     try {
@@ -130,35 +150,28 @@ export default class ClipNestExtension extends Extension {
     }
 
     _applyConfig(values) {
-        this._configLoaded = true;
-        if (Number.isFinite(values.max_text_bytes))
-            this._maxTextBytes = values.max_text_bytes;
-        if (Number.isFinite(values.max_image_bytes))
-            this._maxImageBytes = values.max_image_bytes;
-        const interval = values.poll_interval_ms;
-        if (Number.isFinite(interval) && interval >= 100 &&
-            interval !== this._pollIntervalMs) {
-            this._pollIntervalMs = interval;
+        const before = this._settings;
+        this._settings = applyConfig(before, values);
+        if (this._settings.pollIntervalMs !== before.pollIntervalMs)
             this._armTimer();
-        }
     }
 
     _poll() {
-        if (!this._clipboard || !this._bus)
+        if (!this._enabled || !this._clipboard || !this._bus)
             return;
 
         this._configTicks += 1;
-        const due = this._configLoaded ? CONFIG_REFRESH_TICKS : CONFIG_RETRY_TICKS;
+        const due = this._settings.loaded ? CONFIG_REFRESH_TICKS : CONFIG_RETRY_TICKS;
         if (this._configTicks >= due) {
             this._configTicks = 0;
             this._loadConfig();
         }
 
-        if (this._reading) {
-            const elapsed = (GLib.get_monotonic_time() - this._readStartedAt) / 1000;
-            if (elapsed < READ_TIMEOUT_MS)
-                return;
+        if (readStalled(this._reading, this._readStartedAt,
+            GLib.get_monotonic_time(), READ_TIMEOUT_MS)) {
             this._reading = false;
+        } else if (this._reading) {
+            return;
         }
 
         let mimetypes = [];
@@ -173,26 +186,19 @@ export default class ClipNestExtension extends Extension {
         // Text wins when the owner offers both: copying a cell out of a
         // spreadsheet or a link out of a browser should land as text, not as a
         // rendered image of it.
-        if (this._maxTextBytes > 0 && mimetypes.some(type => TEXT_MIMETYPES.includes(type))) {
+        if (this._settings.maxTextBytes > 0 &&
+            mimetypes.some(type => TEXT_MIMETYPES.includes(type))) {
             this._readText();
             return;
         }
 
         // A size of zero means "do not record this kind", so there is no point
         // in transferring the payload at all.
-        if (this._maxImageBytes > 0) {
-            const image = this._pickImageMimetype(mimetypes);
+        if (this._settings.maxImageBytes > 0) {
+            const image = pickImageMimetype(mimetypes, IMAGE_MIMETYPES);
             if (image)
                 this._readImage(image);
         }
-    }
-
-    _pickImageMimetype(mimetypes) {
-        for (const preferred of IMAGE_MIMETYPES) {
-            if (mimetypes.includes(preferred))
-                return preferred;
-        }
-        return mimetypes.find(type => type.startsWith('image/')) ?? null;
     }
 
     _beginRead() {
@@ -209,10 +215,12 @@ export default class ClipNestExtension extends Extension {
         try {
             this._clipboard.get_text(St.ClipboardType.CLIPBOARD, (_clipboard, text) => {
                 this._endRead();
-                if (!text || text.length > this._maxTextBytes)
+                if (!this._enabled)
+                    return;
+                if (!text || !withinLimit(text.length, this._settings.maxTextBytes))
                     return;
 
-                const key = `text:${text.length}:${this._checksum(text)}`;
+                const key = textKey(text, this._checksum.bind(this));
                 if (key === this._lastKey)
                     return;
                 this._lastKey = key;
@@ -230,11 +238,13 @@ export default class ClipNestExtension extends Extension {
             this._clipboard.get_content(St.ClipboardType.CLIPBOARD, mimetype,
                 (_clipboard, bytes) => {
                     this._endRead();
+                    if (!this._enabled)
+                        return;
                     const data = toByteArray(bytes);
-                    if (!data || data.length === 0 || data.length > this._maxImageBytes)
+                    if (!data || !withinLimit(data.length, this._settings.maxImageBytes))
                         return;
 
-                    const key = this._imageKey(data);
+                    const key = imageKey(data, this._checksum.bind(this));
                     if (key === this._lastKey)
                         return;
                     this._lastKey = key;
@@ -247,19 +257,10 @@ export default class ClipNestExtension extends Extension {
     }
 
     /**
-     * Images are fingerprinted from their length plus a slice of both ends:
-     * hashing several megabytes on every poll would keep the shell busy. The
-     * daemon still hashes the payload exactly, so this only decides whether to
-     * send it at all.
+     * The hash everything else is built from. GNOME's own implementation when it
+     * is there, a length-based fallback when it is not - see `lib/clipboard.js`
+     * for how the result is used, and why small images are hashed whole.
      */
-    _imageKey(data) {
-        const head = data.subarray(0, FINGERPRINT_BYTES);
-        const tail = data.length > FINGERPRINT_BYTES
-            ? data.subarray(data.length - FINGERPRINT_BYTES)
-            : head;
-        return `image:${data.length}:${this._checksum(head)}:${this._checksum(tail)}`;
-    }
-
     _checksum(value) {
         try {
             if (typeof value === 'string')
@@ -272,11 +273,15 @@ export default class ClipNestExtension extends Extension {
     }
 
     _send(method, params) {
+        if (!this._enabled || !this._bus)
+            return;
         try {
             this._bus.call(
                 BUS_NAME, OBJECT_PATH, INTERFACE, method, params, null,
                 Gio.DBusCallFlags.NONE, 2000, null,
                 (connection, result) => {
+                    if (!this._enabled)
+                        return;
                     try {
                         connection.call_finish(result);
                         this._warnedDaemon = false;
@@ -296,17 +301,4 @@ export default class ClipNestExtension extends Extension {
             logError(e, 'ClipNest: cannot talk to the daemon');
         }
     }
-}
-
-/** GBytes may arrive wrapped or already unwrapped, depending on the call. */
-function toByteArray(value) {
-    if (!value)
-        return null;
-    if (value instanceof Uint8Array)
-        return value;
-    if (typeof value.get_data === 'function')
-        return value.get_data();
-    if (typeof value.toArray === 'function')
-        return value.toArray();
-    return null;
 }

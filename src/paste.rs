@@ -939,7 +939,7 @@ fn dict_string(dict: &HashMap<String, glib::Variant>, key: &str) -> Option<Strin
 ///
 /// `XDG_DATA_HOME` is honoured, so a session that keeps its data elsewhere keeps
 /// this with it.
-fn token_path() -> PathBuf {
+pub fn token_path() -> PathBuf {
     install::data_home().join("clipnest/portal-restore-token")
 }
 
@@ -947,14 +947,127 @@ fn load_token() -> Option<String> {
     load_token_from(&token_path())
 }
 
-fn save_token(token: &str) {
-    let path = token_path();
-    if let Some(parent) = path.parent() {
-        if std::fs::create_dir_all(parent).is_err() {
-            return;
+/// The mode a secret file has to have. Anything a group or another user can read
+/// is one `cat` away from being used to type into this session.
+pub const SECRET_MODE: u32 = 0o600;
+/// The mode the directory holding it has to have.
+pub const SECRET_DIR_MODE: u32 = 0o700;
+
+/// What the token file looks like right now. Used by `doctor`, which asks the
+/// question a user cannot: is the file the portal's answer is kept in readable by
+/// anybody else?
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TokenState {
+    /// No token yet: auto-paste has simply not been allowed.
+    Missing,
+    /// Present, and readable only by its owner.
+    Private,
+    /// Present, and readable by somebody else.
+    Exposed(u32),
+    /// There, but not readable: a broken file, or a directory we cannot enter.
+    Unreadable(String),
+}
+
+pub fn token_state() -> TokenState {
+    token_state_at(&token_path())
+}
+
+fn token_state_at(path: &Path) -> TokenState {
+    let Ok(metadata) = std::fs::metadata(path) else {
+        return TokenState::Missing;
+    };
+    if !metadata.is_file() {
+        return TokenState::Unreadable("not a regular file".to_string());
+    }
+    if std::fs::read_to_string(path).is_err() {
+        return TokenState::Unreadable("cannot be read".to_string());
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = metadata.permissions().mode() & 0o777;
+        if mode & 0o077 != 0 {
+            return TokenState::Exposed(mode);
         }
     }
-    save_token_to(&path, token);
+    TokenState::Private
+}
+
+/// Deletes the token, which is what "forget that I allowed pasting" means.
+///
+/// Only the token: the history is the user's data and lives in another file, and
+/// a permission that can be revoked should never be revocable *by losing the
+/// clipboard history*.
+/// Returns whether there was anything to remove.
+pub fn forget_token() -> Result<bool, String> {
+    forget_token_at(&token_path())
+}
+
+/// The path-taking half, so the tests can work in a sandbox instead of on the
+/// real token.
+fn forget_token_at(path: &Path) -> Result<bool, String> {
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(true),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(err) => Err(format!("cannot remove {}: {err}", path.display())),
+    }
+}
+
+/// Tightens the permissions of the token and its directory, for the case where
+/// an earlier version (or a careless `cp`) left them open.
+pub fn tighten_token() -> Result<TokenState, String> {
+    let path = token_path();
+    let state = token_state_at(&path);
+    if let Some(parent) = path.parent() {
+        set_dir_mode(parent).map_err(|err| format!("cannot secure {}: {err}", parent.display()))?;
+    }
+    if matches!(state, TokenState::Exposed(_)) {
+        // Rewriting is what fixes it: the file is ours and its contents are
+        // exactly what a fresh write would produce.
+        match load_token_from(&path) {
+            Some(token) => save_token_to(&path, &token)
+                .map_err(|err| format!("cannot rewrite {}: {err}", path.display()))?,
+            None => {
+                std::fs::remove_file(&path)
+                    .map_err(|err| format!("cannot remove {}: {err}", path.display()))?;
+            }
+        }
+    }
+    Ok(token_state_at(&path))
+}
+
+/// Makes the directory that holds secrets readable only by its owner. A
+/// no-op on anything that is not Unix.
+fn set_dir_mode(dir: &Path) -> std::io::Result<()> {
+    if !dir.is_dir() {
+        return Ok(());
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let metadata = std::fs::metadata(dir)?;
+        let mode = metadata.permissions().mode() & 0o777;
+        if mode & 0o077 != 0 {
+            std::fs::set_permissions(dir, std::fs::Permissions::from_mode(SECRET_DIR_MODE))?;
+        }
+    }
+    Ok(())
+}
+
+/// Saves the token, complaining out loud when it cannot.
+///
+/// The failure mode to avoid is silence: a token that was not saved means the
+/// permission dialog comes back at the next login, and without a word in the log
+/// that looks like the tool forgetting a grant it was given.
+fn save_token(token: &str) {
+    let path = token_path();
+    if let Err(err) = save_token_to(&path, token) {
+        eprintln!(
+            "clipnest: cannot remember the paste permission in {}: {err}",
+            path.display()
+        );
+        eprintln!("         the permission dialog will appear again next time");
+    }
 }
 
 fn load_token_from(path: &Path) -> Option<String> {
@@ -967,19 +1080,40 @@ fn load_token_from(path: &Path) -> Option<String> {
     }
 }
 
-/// Writes the token so a crash cannot leave a half-written one behind.
-fn save_token_to(path: &Path, token: &str) {
+/// Writes the token so a crash cannot leave a half-written one behind, and so
+/// that the file it lands in is readable only by its owner.
+///
+/// The permissions are set on the temporary file *before* the rename: a mode set
+/// afterwards would leave a window in which the secret exists with the umask's
+/// permissions, and the rename is what makes the swap atomic either way.
+fn save_token_to(path: &Path, token: &str) -> std::io::Result<()> {
     let Some(parent) = path.parent() else {
-        return;
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "the token path has no directory",
+        ));
     };
-    if std::fs::create_dir_all(parent).is_err() {
-        return;
-    }
+    std::fs::create_dir_all(parent)?;
+    set_dir_mode(parent)?;
     // Same directory, so the rename below is atomic rather than a copy.
     let temporary = parent.join(".clipnest-token.new");
-    if std::fs::write(&temporary, token).is_ok() && std::fs::rename(&temporary, path).is_err() {
-        let _ = std::fs::remove_file(&temporary);
+    {
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create(true).truncate(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(SECRET_MODE);
+        }
+        let mut file = options.open(&temporary)?;
+        std::io::Write::write_all(&mut file, token.as_bytes())?;
+        file.sync_all()?;
     }
+    if let Err(err) = std::fs::rename(&temporary, path) {
+        let _ = std::fs::remove_file(&temporary);
+        return Err(err);
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1268,7 +1402,7 @@ mod tests {
 
         // Nothing to restore yet is not an error.
         assert_eq!(load_token_from(&path), None);
-        save_token_to(&path, "token-1");
+        save_token_to(&path, "token-1").unwrap();
         assert_eq!(load_token_from(&path).as_deref(), Some("token-1"));
         // Whitespace from the file is not part of the token.
         std::fs::write(&path, "  token-2 \n").unwrap();
@@ -1277,7 +1411,7 @@ mod tests {
         std::fs::write(&path, "\n").unwrap();
         assert_eq!(load_token_from(&path), None);
         // A later grant replaces the earlier one.
-        save_token_to(&path, "token-3");
+        save_token_to(&path, "token-3").unwrap();
         assert_eq!(load_token_from(&path).as_deref(), Some("token-3"));
         // Nothing but the token itself is left behind by the atomic write.
         let leftovers: Vec<_> = std::fs::read_dir(base.join("clipnest"))
@@ -1286,6 +1420,72 @@ mod tests {
             .map(|entry| entry.file_name().to_string_lossy().to_string())
             .collect();
         assert_eq!(leftovers, vec!["portal-restore-token".to_string()]);
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// The token is a permission to type into this session. A file any user on
+    /// the machine can read is a permission anybody can borrow.
+    #[test]
+    fn the_token_is_private() {
+        let base = std::env::temp_dir().join(format!(
+            "clipnest-token-mode-{}-{}",
+            std::process::id(),
+            crate::db::now_ms()
+        ));
+        let path = base.join("clipnest/portal-restore-token");
+
+        save_token_to(&path, "token").unwrap();
+        assert_eq!(token_state_at(&path), TokenState::Private);
+
+        // An older version, or a careless `cp`, can leave it wide open; there is
+        // no silent write to fix that, so the repair has to be asked for.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+            assert_eq!(token_state_at(&path), TokenState::Exposed(0o644));
+            // Rewriting is the repair: the temporary file is created with the
+            // right mode before the rename, so there is no open window.
+            save_token_to(&path, "token").unwrap();
+            assert_eq!(token_state_at(&path), TokenState::Private);
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, SECRET_MODE, "token mode should be 0600, was {mode:o}");
+            let dir_mode = std::fs::metadata(base.join("clipnest"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(dir_mode, SECRET_DIR_MODE);
+        }
+
+        // A file that is not there is a state of its own, not an error: it just
+        // means auto-paste has not been allowed yet.
+        assert_eq!(token_state_at(&base.join("clipnest/nothing")), TokenState::Missing);
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn forgetting_the_permission_leaves_the_history_alone() {
+        // The one thing a reset must never do: take the clipboard history with
+        // it. They are different files, and this test is what keeps them apart.
+        let base = std::env::temp_dir().join(format!(
+            "clipnest-token-forget-{}-{}",
+            std::process::id(),
+            crate::db::now_ms()
+        ));
+        std::fs::create_dir_all(&base).unwrap();
+        let token = base.join("clipnest/portal-restore-token");
+        let history = base.join("clipnest/history.db");
+        save_token_to(&token, "token").unwrap();
+        std::fs::write(&history, "not really a database").unwrap();
+
+        forget_token_at(&token).unwrap();
+        assert_eq!(token_state_at(&token), TokenState::Missing);
+        assert!(history.is_file(), "the history went with the token");
+        // Forgetting twice is not an error, it is just nothing left to do.
+        assert!(!forget_token_at(&token).unwrap());
 
         let _ = std::fs::remove_dir_all(&base);
     }

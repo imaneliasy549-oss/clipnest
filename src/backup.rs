@@ -157,12 +157,35 @@ pub fn import(store: &Store, dir: &Path) -> Result<Summary, String> {
                 "no {INDEX} in {}; reading every file in the directory instead",
                 dir.display()
             ));
-            scan_directory(dir)?
+            scan_directory(dir, &mut summary)?
         }
     };
 
+    // The biggest payload this configuration would keep. Anything larger is
+    // refused *before* it is read: a backup directory is a directory of files
+    // somebody else may have written, and `read` on a 40 GB entry would take the
+    // machine's memory rather than one clipboard entry.
+    let read_cap = config.max_text_bytes.max(config.max_image_bytes).max(0) as u64;
+
     for entry in entries {
-        let Ok(data) = std::fs::read(dir.join(&entry.file)) else {
+        let path = match safe_entry_path(dir, &entry.file) {
+            Ok(path) => path,
+            Err(refusal) => {
+                summary.skipped += 1;
+                summary.note(refusal);
+                continue;
+            }
+        };
+        let size = std::fs::metadata(&path).map(|meta| meta.len()).unwrap_or(0);
+        if size > read_cap {
+            summary.skipped += 1;
+            summary.note(format!(
+                "{} is {size} bytes, larger than any limit in this configuration",
+                entry.file
+            ));
+            continue;
+        }
+        let Ok(data) = std::fs::read(&path) else {
             summary.skipped += 1;
             summary.note(format!("{} is missing", entry.file));
             continue;
@@ -321,13 +344,28 @@ fn parse_index(text: &str, summary: &mut Summary) -> Vec<Entry> {
 /// A backup without an index: every file in the directory, by name, so the
 /// numbering an export used keeps the order. Text and image are told apart by
 /// their content, not by their name.
-fn scan_directory(dir: &Path) -> Result<Vec<Entry>, String> {
+fn scan_directory(dir: &Path, summary: &mut Summary) -> Result<Vec<Entry>, String> {
     let read = std::fs::read_dir(dir).map_err(|err| format!("cannot read {}: {err}", dir.display()))?;
-    let mut files: Vec<PathBuf> = read
-        .filter_map(|entry| entry.ok())
-        .map(|entry| entry.path())
-        .filter(|path| path.is_file())
-        .collect();
+    let mut files: Vec<PathBuf> = Vec::new();
+    for item in read.filter_map(|entry| entry.ok()) {
+        // `file_type` from the directory listing does not follow a link, which
+        // is the whole point: a symlink in a backup directory is a way to make an
+        // import read a file that is not in the backup.
+        let Ok(kind) = item.file_type() else {
+            continue;
+        };
+        if kind.is_symlink() {
+            summary.skipped += 1;
+            summary.note(format!(
+                "{} is a symbolic link, which a backup never contains",
+                item.file_name().to_string_lossy()
+            ));
+            continue;
+        }
+        if kind.is_file() {
+            files.push(item.path());
+        }
+    }
     files.sort();
     Ok(files
         .into_iter()
@@ -351,6 +389,40 @@ fn scan_directory(dir: &Path) -> Result<Vec<Entry>, String> {
             })
         })
         .collect())
+}
+
+/// The path of one entry inside the backup directory, or the reason it is not
+/// one.
+///
+/// `index.tsv` is a text file, and a text file can say `../../.ssh/id_rsa`. That
+/// entry would then be read from outside the backup and stored as a clipboard
+/// entry, where `clipnest get` would print it. Nothing about importing a backup
+/// needs a name with a separator in it, so those are refused - as are symbolic
+/// links, which are the same trick written differently.
+fn safe_entry_path(dir: &Path, name: &str) -> Result<PathBuf, String> {
+    if name.is_empty() {
+        return Err("the index names an empty file".to_string());
+    }
+    if name == "." || name == ".." {
+        return Err(format!("'{name}' is not a file name"));
+    }
+    if name.contains(['/', '\\', '\0']) {
+        return Err(format!(
+            "'{name}' is not a plain file name; a backup keeps its entries in one directory"
+        ));
+    }
+    let path = dir.join(name);
+    let metadata = std::fs::symlink_metadata(&path)
+        .map_err(|_| format!("'{name}' is missing"))?;
+    if metadata.file_type().is_symlink() {
+        return Err(format!(
+            "'{name}' is a symbolic link, which a backup never contains"
+        ));
+    }
+    if !metadata.is_file() {
+        return Err(format!("'{name}' is not a regular file"));
+    }
+    Ok(path)
 }
 
 fn is_empty(dir: &Path) -> Result<bool, String> {
@@ -584,6 +656,129 @@ mod tests {
         // With --force it writes, and leaves the other files alone.
         assert_eq!(export(&source, &dir, -1, true).unwrap().entries(), 1);
         assert!(dir.join("something-else.txt").is_file());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The one import that must never work: an index pointing outside the
+    /// directory it came from.
+    #[test]
+    fn an_index_cannot_read_outside_its_directory() {
+        let dir = temp_dir("traversal");
+        std::fs::create_dir_all(&dir).unwrap();
+        // The file the index would like to have read, just outside the backup.
+        let secret = dir.parent().unwrap().join(format!(
+            "clipnest-secret-{}-{}.txt",
+            std::process::id(),
+            now_ms()
+        ));
+        std::fs::write(&secret, "this is not a clipboard entry").unwrap();
+        let outside = format!("../{}", secret.file_name().unwrap().to_string_lossy());
+        std::fs::write(
+            dir.join(INDEX),
+            format!(
+                "{HEADER}\n{}\n1\ttext\t{outside}\t0\t0\t0\t\t\n",
+                COLUMNS.join("\t")
+            ),
+        )
+        .unwrap();
+
+        let target = store();
+        let summary = import(&target, &dir).unwrap();
+        assert_eq!(summary.text, 0, "an entry from outside the backup was imported");
+        assert_eq!(summary.skipped, 1);
+        assert_eq!(target.list("", -1).unwrap().len(), 0);
+        assert!(
+            summary.notes.iter().any(|note| note.contains("plain file name")),
+            "the refusal should say what was wrong: {:?}",
+            summary.notes
+        );
+        // A path that only looks like a name - Windows separators, or an empty
+        // one - is refused for the same reason.
+        assert!(safe_entry_path(&dir, "..\\..\\etc\\passwd").is_err());
+        assert!(safe_entry_path(&dir, "..").is_err());
+        assert!(safe_entry_path(&dir, "").is_err());
+
+        let _ = std::fs::remove_file(&secret);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_symbolic_link_is_not_an_entry() {
+        // The same trick with a different spelling: it does not matter how the
+        // index names it, the file is not in the backup.
+        let dir = temp_dir("symlink");
+        std::fs::create_dir_all(&dir).unwrap();
+        let secret = dir.parent().unwrap().join(format!(
+            "clipnest-target-{}-{}.txt",
+            std::process::id(),
+            now_ms()
+        ));
+        std::fs::write(&secret, "not mine to read").unwrap();
+        std::os::unix::fs::symlink(&secret, dir.join("000001.txt")).unwrap();
+
+        // Without an index the directory is read by name, and the link is not
+        // followed there either.
+        let target = store();
+        let summary = import(&target, &dir).unwrap();
+        assert_eq!(summary.entries(), 0);
+        assert!(summary.skipped >= 1);
+        assert_eq!(target.list("", -1).unwrap().len(), 0);
+
+        // And with an index that names it.
+        std::fs::write(
+            dir.join(INDEX),
+            format!(
+                "{HEADER}\n{}\n1\ttext\t000001.txt\t0\t0\t0\t\t\n",
+                COLUMNS.join("\t")
+            ),
+        )
+        .unwrap();
+        let target = store();
+        let summary = import(&target, &dir).unwrap();
+        assert_eq!(summary.entries(), 0);
+        assert_eq!(summary.skipped, 1);
+
+        let _ = std::fs::remove_file(&secret);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_entry_too_big_to_read_is_refused_before_reading_it() {
+        let dir = temp_dir("too-big");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("000001.txt"), vec![b'x'; 4096]).unwrap();
+
+        let target = Store::from_conn_with(
+            Connection::open_in_memory().unwrap(),
+            Config {
+                max_text_bytes: 1024,
+                max_image_bytes: 1024,
+                ..Config::default()
+            },
+        )
+        .unwrap();
+        let summary = import(&target, &dir).unwrap();
+        assert_eq!(summary.entries(), 0);
+        assert!(
+            summary
+                .notes
+                .iter()
+                .any(|note| note.contains("larger than any limit")),
+            "the note should say the file was never read: {:?}",
+            summary.notes
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_empty_directory_imports_nothing_without_failing() {
+        let dir = temp_dir("empty");
+        std::fs::create_dir_all(&dir).unwrap();
+        let target = store();
+        let summary = import(&target, &dir).unwrap();
+        assert_eq!(summary.entries(), 0);
+        // Not a directory at all is still an error worth reporting.
+        assert!(import(&target, &dir.join("nope")).is_err());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

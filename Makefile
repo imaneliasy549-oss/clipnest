@@ -12,7 +12,13 @@ DBUS_SERVICE := $(DBUS_DIR)/dev.clipnest.Daemon.service
 # The account the project lives under on GitHub. It appears in the packaging
 # metadata and in the instructions, so it is set in one place and substituted
 # everywhere: `make set-github GH=yourname`.
-GH       ?= USERNAME
+#
+# The default is read back out of Cargo.toml rather than being a second copy of
+# the same fact: `set-github` writes both, so a literal here could disagree with
+# it - which is exactly what happened, warning about a placeholder while the
+# files held the real account. Empty means "no account set", and the two places
+# that care about it say so.
+GH       ?= $(shell sed -n 's|^repository *= *"https://github.com/\(.*\)/clipnest".*|\1|p' Cargo.toml | head -1)
 
 # Release artifacts, laid out one directory per target. See dist/README.md once
 # they are built, and RELEASING.md for how a release is made.
@@ -43,7 +49,8 @@ define ubuntu_release
   esac
 endef
 
-.PHONY: build check install uninstall enable disable restart clean deb deb-verify \
+.PHONY: build check check-rust test-extension bootstrap install uninstall enable \
+        disable restart clean deb deb-verify smoke \
         install-portal-guard uninstall-portal-guard \
         dist dist-deb dist-tarball dist-source dist-extra dist-notes dist-verify \
         set-github preflight
@@ -51,9 +58,47 @@ endef
 build:
 	cargo build --release
 
-check:
+# Everything the test suite is: the Rust tests, the JavaScript ones, and the
+# linter. `check-rust` is the half that needs no gjs or node.
+check: check-rust test-extension
+
+check-rust:
 	cargo clippy --all-targets -- -D warnings
 	cargo test
+
+# The extension's decisions (image fingerprinting, limits, timeouts) are plain
+# functions in `extension/lib/clipboard.js`, and this runs them for real. gjs is
+# what the extension actually runs on; node is the fallback for a machine without
+# GNOME. Neither is a build dependency, so a missing one is reported, not fatal.
+test-extension:
+	@if command -v gjs >/dev/null 2>&1; then \
+	  echo "extension: gjs -m extension/tests/units.js"; \
+	  gjs -m extension/tests/units.js; \
+	elif command -v node >/dev/null 2>&1; then \
+	  echo "extension: node (--experimental-default-type=module)"; \
+	  node --experimental-default-type=module extension/tests/units.js; \
+	else \
+	  echo "extension: skipped, no gjs and no node on PATH"; \
+	fi
+
+# What a first build needs, checked rather than installed: changing somebody's
+# package manager state is their decision, and a script that quietly does it is
+# how a build machine ends up with a compiler nobody asked for.
+bootstrap:
+	@missing=0; \
+	for cmd in cargo pkg-config cc; do \
+	  command -v $$cmd >/dev/null 2>&1 || { echo "missing: $$cmd"; missing=1; }; \
+	done; \
+	for pkg in gtk4 libadwaita-1 sqlite3; do \
+	  pkg-config --exists $$pkg 2>/dev/null || { \
+	    echo "missing: $$pkg (apt: libgtk-4-dev libadwaita-1-dev libsqlite3-dev)"; missing=1; }; \
+	done; \
+	command -v cargo-deb >/dev/null 2>&1 || \
+	  echo "note: cargo-deb is missing, so 'make deb' will not work (cargo install cargo-deb)"; \
+	command -v gjs >/dev/null 2>&1 || command -v node >/dev/null 2>&1 || \
+	  echo "note: neither gjs nor node is installed, so 'make test-extension' will skip"; \
+	if [ $$missing -eq 0 ]; then echo "build dependencies: all present"; \
+	else echo "install the missing ones, then run 'make' again"; exit 1; fi
 
 # `setup` is what puts the extension in place, enables it, registers the
 # shortcut and restarts the service - the same command a package install asks the
@@ -130,11 +175,12 @@ dist: check dist-deb dist-tarball dist-source dist-extra dist-notes
 	@echo "== $(DIST)/ =="
 	@cd $(DIST) && find . -mindepth 1 -maxdepth 2 -printf '%y %p\n' | sort
 	@echo
-	@test "$(GH)" != "USERNAME" || { \
-		echo "!! $(GH) is still a placeholder: dist/*/clipnest.spec and dist/*/PKGBUILD"; \
-		echo "!! point at a GitHub URL that does not exist. Fix it with:"; \
+	@if [ -z "$(GH)" ] || [ "$(GH)" = "USERNAME" ]; then \
+		echo "!! no GitHub account is set: dist/*/clipnest.spec and dist/*/PKGBUILD"; \
+		echo "!! point at a URL that does not exist. Fix it with:"; \
 		echo "!!     make set-github GH=<your account>   &&   make dist"; \
-		echo; }
+		echo; \
+	fi
 	@echo "Tag v$(VERSION) and push it: the release workflow builds the arm64, RPM"
 	@echo "and Fedora-side artifacts and attaches everything to that tag."
 
@@ -181,6 +227,9 @@ dist-tarball: build
 	                $(DIST)/tarball/$(PORTABLE)/data/dev.clipnest.Panel.svg
 	install -m644 extension/metadata.json extension/extension.js \
 	                $(DIST)/tarball/$(PORTABLE)/data/gnome-shell/$(EXT_UUID)/
+	install -d $(DIST)/tarball/$(PORTABLE)/data/gnome-shell/$(EXT_UUID)/lib
+	install -m644 extension/lib/clipboard.js \
+	                $(DIST)/tarball/$(PORTABLE)/data/gnome-shell/$(EXT_UUID)/lib/
 	install -m755 packaging/tarball/install.sh packaging/tarball/uninstall.sh \
 	                $(DIST)/tarball/$(PORTABLE)/
 	install -m644 README.md CHANGELOG.md LICENSE $(DIST)/tarball/$(PORTABLE)/
@@ -268,6 +317,12 @@ dist-verify:
 	@echo "== layout =="
 	@cd $(DIST) && find . -mindepth 1 -maxdepth 2 -printf '%y %p\n' | sort
 
+# The steps printed at the end differ with the repository: inside a recipe every
+# line is part of one shell command (a `#` there comments out the rest of it, not
+# just that line), so the two cases are one `if` rather than two comment blocks.
+# Saying `git init` to somebody whose repository is on its third release is noise,
+# and worse, `git init` there is a step backwards.
+#
 # Everything a first push trips over, in one read-only pass: an unset git identity
 # (git refuses to commit at all), a `USERNAME` left in the metadata (the release
 # would point at a repository that does not exist), and a dist/ built before the
@@ -331,10 +386,16 @@ preflight:
 	else \
 		echo "  fix the [FAIL] lines above, then run 'make preflight' again. next:"; \
 	fi; \
-	echo "    git init -b main && git add . && git status --short"; \
-	echo "    git commit -m 'ClipNest $(VERSION)'"; \
-	echo "    git remote add origin https://github.com/<account>/clipnest.git"; \
-	echo "    git push -u origin main"; \
+	if git rev-parse --git-dir >/dev/null 2>&1; then \
+		echo "    git add -A && git status --short      # review, then:"; \
+		echo "    git commit -m 'ClipNest $(VERSION)'"; \
+		echo "    git push origin main"; \
+	else \
+		echo "    git init -b main && git add . && git status --short"; \
+		echo "    git commit -m 'ClipNest $(VERSION)'"; \
+		echo "    git remote add origin https://github.com/<account>/clipnest.git"; \
+		echo "    git push -u origin main"; \
+	fi; \
 	echo "    git tag -a v$(VERSION) -m 'ClipNest $(VERSION)' && git push origin v$(VERSION)"; \
 	echo; \
 	if [ $$ok -eq 1 ]; then exit 0; else exit 1; fi

@@ -49,19 +49,50 @@ const CHILD_SCHEMA: &str = "org.gnome.settings-daemon.plugins.media-keys.custom-
 
 /// Which installation is in charge on this machine.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Running {
+    /// `/usr/bin/clipnest` is the one running.
+    Package,
+    /// The copy in the user's home is the one running.
+    User,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Layout {
     /// Files handed to the session by a distro package, under `/usr`.
     Package,
     /// A `make install` copy under the user's home.
     User,
+    /// Both are installed. Which one `$PATH` actually runs is spelled out,
+    /// because that is the thing that decides what the rest of the report means.
+    Both { running: Running },
     /// Neither: the binary runs from wherever it was built.
     Local,
 }
 
 /// Judges the installation from paths that are already known, so the rule can be
 /// tested without writing anything.
-pub fn classify_layout(packaged_binary: bool, user_binary: bool) -> Layout {
-    if packaged_binary {
+/// Which installation is in charge, and which one is only *also* there.
+///
+/// The second half is the part a user cannot see: `~/.local/bin` comes first in
+/// `$PATH` on most desktops, so a `make install` copy keeps running while the
+/// package looks perfectly installed. Saying "system package" in that state was
+/// wrong on the one line that is supposed to explain what is running.
+///
+/// `running_user_copy` is what `current_exe()` says, not what exists.
+pub fn classify_layout(
+    packaged_binary: bool,
+    user_binary: bool,
+    running_user_copy: bool,
+) -> Layout {
+    if packaged_binary && user_binary {
+        Layout::Both {
+            running: if running_user_copy {
+                Running::User
+            } else {
+                Running::Package
+            },
+        }
+    } else if packaged_binary {
         Layout::Package
     } else if user_binary {
         Layout::User
@@ -71,9 +102,14 @@ pub fn classify_layout(packaged_binary: bool, user_binary: bool) -> Layout {
 }
 
 pub fn layout() -> Layout {
+    let user = user_bin();
+    let running_user_copy = std::env::current_exe()
+        .map(|executable| executable == user)
+        .unwrap_or(false);
     classify_layout(
         Path::new(SYSTEM_BIN).is_file(),
-        user_bin().is_file(),
+        user.is_file(),
+        running_user_copy,
     )
 }
 
@@ -111,11 +147,15 @@ pub fn user_bin() -> PathBuf {
     home().join(".local/bin/clipnest")
 }
 
-/// The extension files as shipped inside this binary.
-pub fn extension_files() -> [(&'static str, &'static str); 2] {
+/// The extension files as shipped inside this binary, as `(relative path,
+/// contents)`. The names are relative paths because the extension is more than
+/// one file: the decisions live in `lib/clipboard.js`, which keeps the shell
+/// side small and the logic testable.
+pub fn extension_files() -> [(&'static str, &'static str); 3] {
     [
         ("metadata.json", include_str!("../extension/metadata.json")),
         ("extension.js", include_str!("../extension/extension.js")),
+        ("lib/clipboard.js", include_str!("../extension/lib/clipboard.js")),
     ]
 }
 
@@ -241,7 +281,14 @@ pub fn have(program: &str) -> bool {
 fn write_extension_files(target: &Path) -> Result<(), String> {
     std::fs::create_dir_all(target).map_err(|err| format!("cannot create {}: {err}", target.display()))?;
     for (name, contents) in extension_files() {
-        std::fs::write(target.join(name), contents)
+        let path = target.join(name);
+        // `lib/clipboard.js` lives in a subdirectory; a copy that silently
+        // stopped at the top level would be a shell that cannot load at all.
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|err| format!("cannot create {}: {err}", parent.display()))?;
+        }
+        std::fs::write(&path, contents)
             .map_err(|err| format!("cannot write {name} to {}: {err}", target.display()))?;
     }
     Ok(())
@@ -668,6 +715,15 @@ pub fn setup(binding: Option<&str>) -> ExitCode {
             env!("CARGO_PKG_VERSION"),
             user_bin().display()
         ),
+        Layout::Both { running } => println!(
+            "ClipNest {} is running from {} - a package and a user install are both \
+             present.\nRun 'make uninstall' to drop the user copy, or remove the package.",
+            env!("CARGO_PKG_VERSION"),
+            match running {
+                Running::User => user_bin().display().to_string(),
+                Running::Package => SYSTEM_BIN.to_string(),
+            }
+        ),
         Layout::Local => println!(
             "ClipNest {} is running from a build directory, not from an install.",
             env!("CARGO_PKG_VERSION")
@@ -749,16 +805,58 @@ mod tests {
         assert!(js_constant(extension, "POLL_INTERVAL_MS").is_some_and(|ms| ms > 0));
     }
 
+    /// Every JavaScript file the extension ships, as one string. The decisions
+    /// moved into `lib/clipboard.js`, so a check that only read `extension.js`
+    /// would happily pass while the names on the wire drifted apart.
+    fn bundled_js() -> String {
+        extension_files()
+            .iter()
+            .filter(|(name, _)| name.ends_with(".js"))
+            .map(|(_, contents)| *contents)
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
     #[test]
     fn the_extension_asks_for_the_settings_the_daemon_offers() {
         // The names have to match on both sides of the bus or the extension would
         // quietly keep using its fallbacks.
-        let extension = bundled("extension.js");
+        let extension = bundled_js();
         for key in config::WIRE_KEYS {
-            assert!(
-                extension.contains(key),
-                "extension.js never mentions '{key}'"
-            );
+            assert!(extension.contains(key), "the extension never mentions '{key}'");
+        }
+    }
+
+    #[test]
+    fn every_extension_file_is_one_a_shell_can_load() {
+        // A file the extension imports but the package forgets to ship is a
+        // shell extension that fails to load at login, which is the worst way to
+        // find out. The list is what `setup`, the tarball and the .deb all use.
+        for (name, contents) in extension_files() {
+            assert!(contents.contains('\n'), "{name} looks truncated");
+        }
+        assert!(
+            extension_files().iter().any(|(name, _)| *name == "lib/clipboard.js"),
+            "the module extension.js imports has to be shipped too"
+        );
+        // The import has to name the path the package installs under.
+        for (name, contents) in extension_files() {
+            for line in contents.lines() {
+                let Some((_, target)) = line.split_once("from '") else {
+                    continue;
+                };
+                let Some(target) = target.split('\'').next() else {
+                    continue;
+                };
+                if !target.starts_with('.') {
+                    continue;
+                }
+                let want = target.trim_start_matches("./").to_string();
+                assert!(
+                    extension_files().iter().any(|(file, _)| *file == want),
+                    "{name} imports '{target}', which is not in the shipped file list"
+                );
+            }
         }
     }
 
@@ -887,10 +985,23 @@ mod tests {
 
     #[test]
     fn tells_the_two_installations_apart() {
-        assert_eq!(classify_layout(true, true), Layout::Package);
-        assert_eq!(classify_layout(true, false), Layout::Package);
-        assert_eq!(classify_layout(false, true), Layout::User);
-        assert_eq!(classify_layout(false, false), Layout::Local);
+        assert_eq!(classify_layout(true, false, false), Layout::Package);
+        assert_eq!(classify_layout(false, true, true), Layout::User);
+        assert_eq!(classify_layout(false, false, false), Layout::Local);
+        // Both installed: which one runs is the fact worth reporting, and it is
+        // the one `$PATH` decides, not the one the package manager installed.
+        assert_eq!(
+            classify_layout(true, true, true),
+            Layout::Both {
+                running: Running::User
+            }
+        );
+        assert_eq!(
+            classify_layout(true, true, false),
+            Layout::Both {
+                running: Running::Package
+            }
+        );
 
         // Both supported installations have to be found by the same lookups.
         let extensions = extension_candidates();

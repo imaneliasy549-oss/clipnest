@@ -9,8 +9,9 @@
 # ۱. نام حساب گیت‌هاب را همه‌جا بگذار (Cargo.toml، README، اسپک RPM، PKGBUILD)
 make set-github GH=<account>
 
-# ۲. پروژه سالم است؟
-make check                  # clippy با -D warnings + ۶۳ تست
+# ۲. پروژه سالم است؟ (clippy با -D warnings + تست‌های Rust + ۳۲ تست اکستنشن)
+make bootstrap              # پیش‌نیازها را بررسی می‌کند و می‌گوید چه کم است
+make check
 
 # ۳. چه چیزی کم است؟ (فقط می‌خواند و دستور بعدی را چاپ می‌کند)
 make preflight
@@ -22,6 +23,10 @@ make preflight
 (نسخه‌ای که به مخزن ناموجود اشاره می‌کند)، و `dist/`ی که پیش از آخرین ویرایش
 ساخته شده (سورس تازه تگ می‌خورد ولی باینری قدیمی منتشر می‌شود). در پایان هم
 دستورهای واقعی push را با نسخهٔ درست چاپ می‌کند.
+
+> این مخزن الان روی گیت‌هاب است، پس بخش ۰ و ۱ فقط برای ماشین تازه (یا مخزن جدید)
+> لازم است. برای انتشار نسخه‌های بعدی از بخش ۴ شروع کن: یک تگ بزن و همان ورک‌فلو
+> بسته‌ها را می‌سازد و به انتشار می‌چسباند.
 
 ### هویت git و احراز هویت — تنها چیزی که خودِ پروژه نمی‌تواند بسازد
 
@@ -78,7 +83,7 @@ git init -b main
 git add .
 git status --short          # یک نگاه: نباید target/ یا dist/ یا *.deb بین‌شان باشد
 
-git commit -m "ClipNest 0.7.0: clipboard history for GNOME on Wayland"
+git commit -m "ClipNest 0.8.0: clipboard history for GNOME on Wayland"
 
 # یکی از این دو؛ اولی با کلید SSH، دومی با توکن (Settings → Developer settings →
 # Personal access tokens → Fine-grained: دسترسی Contents روی همین مخزن)
@@ -87,9 +92,9 @@ git remote add origin https://github.com/<account>/clipnest.git
 
 git remote -v               # ببین آدرس درست است
 
-git tag -a v0.7.0 -m "ClipNest 0.7.0"
+git tag -a v0.8.0 -m "ClipNest 0.8.0"
 git push -u origin main
-git push origin v0.7.0      # همین push ورک‌فلوی انتشار را راه می‌اندازد (بخش ۴)
+git push origin v0.8.0      # همین push ورک‌فلوی انتشار را راه می‌اندازد (بخش ۴)
 ```
 
 اگر احراز هویت قبلاً یک‌بار انجام شده باشد (`git config --global user.name/email` و
@@ -98,7 +103,7 @@ git push origin v0.7.0      # همین push ورک‌فلوی انتشار را 
 
 **۳. نتیجه را ببین.** صفحهٔ `Actions` مخزن: ورک‌فلوی `CI` روی `main` (clippy + تست‌ها
 روی `ubuntu-24.04`، به‌علاوهٔ یک شاخهٔ arm64 که فقط در مخزن عمومی وجود دارد) و ورک‌فلوی
-`Release` روی تگ `v0.7.0` که بسته‌ها را می‌سازد و به Releases می‌چسباند.
+`Release` روی تگ `v0.8.0` که بسته‌ها را می‌سازد و به Releases می‌چسباند.
 
 > اگر فقط سورس را می‌خواهی و بسته نمی‌خواهی، تگ را نزن؛ `push` کردن `main` کافی است
 > و `Release` بدون تگ اجرا نمی‌شود.
@@ -189,6 +194,26 @@ make && make install        # بدون root؛ هرچه لازم دارد را ق
 
 ## ۴) انتشار یک نسخه
 
+پیش از تگ زدن، دو چیز را چک کن که خودِ CI نمی‌تواند:
+
+```bash
+make check                     # همه‌چیز سبز
+bash packaging/tests/install-smoke.sh dist/ubuntu-*/clipnest_*.deb
+```
+
+`install-smoke.sh` متادیتای بسته، فهرست فایل‌ها، **یکسان‌بودن فایل‌های اکستنشن داخل
+بسته با مخزن** و اجرا شدن باینری را بررسی می‌کند. اگر با `sudo` اجرایش کنی، نصب واقعی
+با `apt` را هم انجام می‌دهد (روی همین سیستم، قبلش `make uninstall` بزن تا نسخهٔ
+کاربری روی بسته سایه نیندازد).
+
+روی گیت‌هاب، ورک‌فلو `Release` با زدن تگ اجرا می‌شود و سه چیز را می‌سازد:
+`.deb` برای amd64 (روی ۲۴.۰۴، تا کف glibc پایین بماند) و arm64 (روی رانر arm)،
+`.rpm` داخل ایمیج Fedora، و تارْبال سورس + `PKGBUILD`/اسپک آرچ. ورک‌فلوی `CI` هم
+سه چیز را جدا بررسی می‌کند: `make check` روی ۲۴.۰۴، همان روی **۲۶.۰۴** (رانر
+`ubuntu-26.04`)، و **نصب همان بستهٔ ۲۴.۰۴ روی ۲۶.۰۴** — چون «روی ۲۶.۰۴ نصب
+می‌شود» یک ادعاست و باید جایی بررسی شود.
+
+
 1. نسخه را در **دو** جا بالا ببر: `version` در `Cargo.toml` و یک بخش تازه در
    `CHANGELOG.md`. نسخهٔ اکستنشن (`extension/metadata.json`) را هم اگر فایل JS
    عوض شده بالا ببر، وگرنه gnome-shell نسخهٔ قدیمی را در حافظه نگه می‌دارد.
@@ -196,9 +221,9 @@ make && make install        # بدون root؛ هرچه لازم دارد را ق
 
 ```bash
 make check && make dist                     # قبل از تگ، همین‌جا تست و ساخت
-git add -A && git commit -m "ClipNest 0.7.0"
-git tag -a v0.7.0 -m "ClipNest 0.7.0"
-git push origin main && git push origin v0.7.0
+git add -A && git commit -m "ClipNest 0.8.0"
+git tag -a v0.8.0 -m "ClipNest 0.8.0"
+git push origin main && git push origin v0.8.0
 ```
 
 3. ورک‌فلوی `Release` با دیدن تگ `v*` این‌ها را می‌سازد و به همان تگ می‌چسباند:
@@ -225,10 +250,10 @@ git push origin main && git push origin v0.7.0
 وقتی CI هم همان‌ها را می‌سازد:
 
 ```bash
-gh release view v0.7.0                 # اگر نبود:
-gh release create v0.7.0 --title "ClipNest 0.7.0" --generate-notes
+gh release view v0.8.0                 # اگر نبود:
+gh release create v0.8.0 --title "ClipNest 0.8.0" --generate-notes
 
-gh release upload v0.7.0 dist/ubuntu-24.04-amd64/*.deb \
+gh release upload v0.8.0 dist/ubuntu-24.04-amd64/*.deb \
                           dist/tarball/*.tar.gz \
                           dist/source/*.tar.gz \
                           dist/SHA256SUMS

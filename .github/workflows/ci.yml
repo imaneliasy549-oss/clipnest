@@ -26,11 +26,15 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # gjs is not a build dependency: `make check` runs the extension's unit
+      # tests with it when it is there, and with node when it is not. Installing
+      # it here means the JavaScript is exercised on the interpreter it actually
+      # runs on in a session.
       - name: Install the build dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            libgtk-4-dev libadwaita-1-dev libsqlite3-dev
+            libgtk-4-dev libadwaita-1-dev libsqlite3-dev gjs nodejs
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -38,7 +42,102 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
-      # `make check` is clippy with -D warnings plus the test suite; it needs no
-      # display and no database, the tests run against SQLite in memory.
+      # `make check` is clippy with -D warnings plus the Rust test suite and the
+      # extension's unit tests; it needs no display and no database, the tests run
+      # against SQLite in memory.
       - name: Check and test
         run: make check
+
+  next-ubuntu:
+    # The newest Ubuntu, where GNOME Shell is the version the extension declares
+    # support for. Preview images get renamed and rebuilt, so this leg reports
+    # rather than blocks: a red X here means "look", not "the code is broken".
+    #
+    # What this proves: the project still builds and tests green against 26.04's
+    # libraries. What it does not prove: anything about a live GNOME session -
+    # no CI runner has Wayland, the portal or gnome-shell running.
+    name: ubuntu-26.04
+    runs-on: ubuntu-26.04
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install the build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libgtk-4-dev libadwaita-1-dev libsqlite3-dev gjs nodejs dpkg-dev
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Check and test
+        run: make check
+
+      - name: Install cargo-deb
+        run: cargo install cargo-deb --locked
+
+      # The package built here is the one for 26.04's own glibc, which is worth
+      # having: the amd64 .deb a release attaches is built on 24.04 so that it
+      # installs from 24.04 upwards.
+      - name: Build and inspect the package
+        run: |
+          make dist-deb CARGO_FLAGS=
+          bash packaging/tests/install-smoke.sh --no-install dist/ubuntu-*/*.deb
+
+  packaging:
+    # The .deb is built on the oldest supported release and then installed on the
+    # newest one, which is the claim the README makes: a package built on 24.04
+    # works on 26.04. Nothing else in CI would catch a dependency that is
+    # satisfied on the build host and missing on the target.
+    name: install on ubuntu-26.04
+    needs: [check]
+    runs-on: ubuntu-26.04
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install the build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libgtk-4-dev libadwaita-1-dev libsqlite3-dev dpkg-dev
+          cargo install cargo-deb --locked
+
+      - name: Build the package the way a release does
+        run: make dist-deb CARGO_FLAGS=
+
+      # `apt-get install` rather than `dpkg -i`, so the declared dependencies are
+      # resolved for real - that is the thing being tested.
+      - name: Install it and run it
+        run: |
+          sudo bash packaging/tests/install-smoke.sh "$(ls dist/ubuntu-*/*.deb | head -1)"
+          # The daemon is started on a private session bus with its own data
+          # directory: no runner has a GNOME session, and nothing here should
+          # touch a real user's history.
+          sudo dbus-run-session -- env \
+            XDG_DATA_HOME=/tmp/clipnest-smoke-data \
+            XDG_CONFIG_HOME=/tmp/clipnest-smoke-config \
+            timeout 20 /usr/bin/clipnest daemon &
+          sleep 3
+          systemctl --user status clipnest --no-pager || true
+
+  fmt:
+    # Advisory on purpose. This project was developed on a machine without
+    # rustfmt, so a hard failure here would be noise rather than a finding: run
+    # `cargo fmt --all` once where rustfmt exists, then drop `continue-on-error`.
+    name: cargo fmt (advisory)
+    runs-on: ubuntu-24.04
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - run: cargo fmt --all -- --check

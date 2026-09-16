@@ -25,6 +25,7 @@ commands:
   pick <n>           copy the n-th newest entry back to the clipboard
   paste <n>          copy the n-th newest entry and paste it where you are
   paste-access       ask for permission to paste into other windows
+  paste-reset        forget that permission (the history is left alone)
   pin <id>           keep an entry through trimming
   unpin <id>         stop keeping an entry
   delete <id>        remove one entry, and hand its space back
@@ -57,12 +58,15 @@ fn main() -> ExitCode {
     let command = argv.next().unwrap_or_else(|| "daemon".into());
     let args = Args::parse(argv.collect());
 
-    if !args.unknown.is_empty() {
-        eprintln!(
-            "clipnest: ignoring unknown option(s): {}",
-            args.unknown.join(", ")
-        );
+    if !args.problems.is_empty() {
+        // A typo used to be a warning and then the command ran anyway, with the
+        // option silently dropped; `--limt 5` listing the whole history is
+        // exactly the kind of quiet wrong this refuses to do.
+        for problem in &args.problems {
+            eprintln!("clipnest: {problem}");
+        }
         eprintln!("         run 'clipnest help' for the options this build takes");
+        return ExitCode::from(2);
     }
 
     match command.as_str() {
@@ -212,6 +216,7 @@ fn main() -> ExitCode {
             }
         }
         "paste-access" => paste_access(),
+        "paste-reset" => paste_reset(),
         "pin" | "unpin" => {
             let Some(id) = args.id() else {
                 eprintln!("usage: clipnest {command} <id>");
@@ -330,8 +335,7 @@ fn rows_of(array: &glib::Variant) -> Vec<Row> {
 
 fn print_rows(rows: &[Row], json: bool) {
     if json {
-        let body: Vec<String> = rows.iter().map(Row::json).collect();
-        println!("[{}]", body.join(","));
+        println!("{}", json_array(rows));
         return;
     }
     for row in rows {
@@ -340,6 +344,18 @@ fn print_rows(rows: &[Row], json: bool) {
     }
 }
 
+/// The rows as one JSON array. Kept separate from `print_rows` so the escaping
+/// can be tested without a terminal.
+fn json_array(rows: &[Row]) -> String {
+    let body: Vec<String> = rows.iter().map(Row::json).collect();
+    format!("[{}]", body.join(","))
+}
+
+/// Escapes the four characters JSON reserves plus every other control code.
+///
+/// Everything else is copied through as-is: the output is UTF-8, so Persian
+/// text and emoji are already legal JSON and re-encoding them would only make
+/// the output unreadable to a human looking over the shoulder.
 fn json_escape(value: &str) -> String {
     let mut out = String::with_capacity(value.len());
     for ch in value.chars() {
@@ -567,6 +583,33 @@ fn paste_access() -> ExitCode {
             }
         }
         std::thread::sleep(std::time::Duration::from_millis(400));
+    }
+}
+
+/// `clipnest paste-reset`: hands the permission back by deleting the restore
+/// token, which is what makes the portal ask again.
+///
+/// Deliberately not called `paste-forget-permission`: the point is that it is
+/// the *permission* that is forgotten. The history lives in another file, and a
+/// command that could lose it while revoking a grant would be a footgun.
+fn paste_reset() -> ExitCode {
+    let path = paste::token_path();
+    match paste::forget_token() {
+        Ok(true) => {
+            println!("forgot the paste permission (removed {})", path.display());
+            println!("the history was not touched");
+            println!("ask for it again with: clipnest paste-access");
+            ExitCode::SUCCESS
+        }
+        Ok(false) => {
+            println!("nothing to forget: {} does not exist", path.display());
+            println!("the permission was never granted, or was already reset");
+            ExitCode::SUCCESS
+        }
+        Err(err) => {
+            eprintln!("clipnest: {err}");
+            ExitCode::FAILURE
+        }
     }
 }
 
@@ -820,6 +863,20 @@ fn doctor() -> ExitCode {
             "layout: user install ({})",
             install::user_bin().display()
         )),
+        // Both, which is the state that looks fine and is not: the copy in the
+        // user's home comes first in `$PATH`, so what runs is not what the
+        // package manager installed.
+        install::Layout::Both { running } => {
+            warnings += 1;
+            warn(&format!(
+                "layout: a package and a user install are both present; {} is the one running",
+                match running {
+                    install::Running::User => format!("{}", install::user_bin().display()),
+                    install::Running::Package => "/usr/bin/clipnest".to_string(),
+                }
+            ));
+            hint("make uninstall   (drops the user copy; the package and the history stay)");
+        }
         install::Layout::Local => pass("layout: running from a build directory"),
     }
 
@@ -937,6 +994,10 @@ fn doctor() -> ExitCode {
 
     let (state, loaded_version) = gnome_extension_info();
     let bundled_version = bundled_extension_version();
+    // Read again by the session line further down: whether the shell really is
+    // feeding the daemon is the difference between "Wayland" and "Wayland, and
+    // nothing will be captured".
+    let extension_running = install::extension_enabled() && state.eq_ignore_ascii_case("active");
     if !install::extension_enabled() {
         problems += 1;
         fail(&format!("extension {} is not in enabled-extensions", install::extension_uuid()));
@@ -1143,14 +1204,85 @@ fn doctor() -> ExitCode {
         }
     }
 
+    // The token the portal's grant is kept in. It is a permission to type into
+    // this session, so a copy that other accounts can read is worth a warning of
+    // its own - the file is small, and "who else can read my home directory" is
+    // not a question most people can answer from memory.
+    match paste::token_state() {
+        paste::TokenState::Private => pass(&format!(
+            "paste permission: remembered in {} (mode 0600)",
+            paste::token_path().display()
+        )),
+        paste::TokenState::Missing => pass(
+            "paste permission: not granted yet (clipnest paste-access asks for it)",
+        ),
+        paste::TokenState::Exposed(mode) => {
+            warnings += 1;
+            warn(&format!(
+                "paste permission: {} is mode {mode:o}, readable by other users",
+                paste::token_path().display()
+            ));
+            // Rewriting the file is the repair, and it is a write we can do
+            // without asking the portal anything.
+            match paste::tighten_token() {
+                Ok(paste::TokenState::Private) => pass("and it was tightened to mode 0600"),
+                Ok(_) => hint("clipnest paste-reset, then clipnest paste-access"),
+                Err(err) => hint(&format!("fix it by hand: {err}")),
+            }
+        }
+        paste::TokenState::Unreadable(why) => {
+            warnings += 1;
+            warn(&format!(
+                "paste permission: {} {why}",
+                paste::token_path().display()
+            ));
+            hint("clipnest paste-reset, then clipnest paste-access");
+        }
+    }
+
     if !install::have("gnome-extensions") {
         warnings += 1;
         warn("gnome-extensions is not on $PATH (install the gnome-shell package)");
     }
-    if session_type() == "wayland" {
-        pass("session: Wayland (the shell extension is required)");
-    } else {
-        pass(&format!("session: {}", session_type()));
+
+    // The session, and what it means. This is the line a user reads when the
+    // history stays empty, so it names the reason and the next step rather than
+    // printing `$XDG_SESSION_TYPE` and leaving the conclusion to them.
+    let desktop = std::env::var("XDG_CURRENT_DESKTOP").unwrap_or_default();
+    let shell = install::have("gnome-shell");
+    let shell_version = gnome_shell_version().unwrap_or_else(|| "GNOME Shell".to_string());
+    match classify_session(&desktop, &session_type(), extension_running, shell) {
+        SessionState::Supported => pass(&format!(
+            "session: {shell_version} on Wayland (desktop: {desktop})"
+        )),
+        SessionState::ExtensionsOff => {
+            problems += 1;
+            fail("session: GNOME on Wayland, but the extension is not feeding the daemon");
+            hint("nothing will be captured until it runs: clipnest install-extension");
+        }
+        SessionState::ForeignDesktop => {
+            problems += 1;
+            fail(&format!(
+                "session: '{desktop}' on {}; the extension needs gnome-shell to capture anything",
+                session_type()
+            ));
+            hint("ClipNest is built for GNOME; see the README for what works elsewhere");
+        }
+        SessionState::X11 => {
+            warnings += 1;
+            warn(&format!("session: {shell_version} on X11 (desktop: {desktop})"));
+            // Said plainly because it is easy to promise more than is tested: the
+            // extension still does the capturing, and the portal still needs a
+            // RemoteDesktop backend for auto-paste.
+            hint("X11 is not the tested path: capture still goes through the extension");
+        }
+        SessionState::Unknown => {
+            warnings += 1;
+            warn(&format!(
+                "session: cannot tell (XDG_SESSION_TYPE={}, desktop='{desktop}')",
+                session_type()
+            ));
+        }
     }
 
     println!();
@@ -1160,6 +1292,53 @@ fn doctor() -> ExitCode {
     } else {
         println!("{problems} problem(s), {warnings} warning(s) - see the hints above");
         ExitCode::FAILURE
+    }
+}
+
+/// What the session a user is in means for ClipNest.
+#[derive(Debug, PartialEq, Eq)]
+enum SessionState {
+    /// GNOME on Wayland with the extension running: the supported combination.
+    Supported,
+    /// GNOME on Wayland, but nothing is capturing: an empty history, and no
+    /// obvious reason for it.
+    ExtensionsOff,
+    /// A desktop whose shell has no `St.Clipboard` extension to hand: on Wayland
+    /// nothing can be read at all.
+    ForeignDesktop,
+    /// GNOME on X11: works through the same extension, but not the tested path.
+    X11,
+    /// No environment to judge from (a `sudo` shell, a container, ssh).
+    Unknown,
+}
+
+/// Judges the session from what `doctor` has already looked up, so the rule can
+/// be tested without logging into another desktop.
+///
+/// The desktop *name* is deliberately not what decides this. On Ubuntu 26.04,
+/// `XDG_CURRENT_DESKTOP` is `Unity` while GNOME Shell 50.1 is what is running -
+/// a classifier that trusted the name would tell exactly the users this is built
+/// for that their desktop is unsupported. `shell_installed` is the fact that
+/// matters: without gnome-shell there is no extension, and on Wayland nothing
+/// reads the clipboard.
+fn classify_session(
+    desktop: &str,
+    session: &str,
+    extension_running: bool,
+    shell_installed: bool,
+) -> SessionState {
+    match session.to_ascii_lowercase().as_str() {
+        "x11" if shell_installed => SessionState::X11,
+        "x11" => SessionState::ForeignDesktop,
+        "wayland" => match (shell_installed, extension_running) {
+            (false, _) => SessionState::ForeignDesktop,
+            (true, true) => SessionState::Supported,
+            (true, false) => SessionState::ExtensionsOff,
+        },
+        // No session type at all: a container, a `sudo` shell, a serial console.
+        // A named desktop without gnome-shell is still worth saying out loud.
+        _ if !shell_installed && !desktop.is_empty() => SessionState::ForeignDesktop,
+        _ => SessionState::Unknown,
     }
 }
 
@@ -1217,6 +1396,20 @@ fn is_startup_race(message: &str) -> bool {
 
 fn session_type() -> String {
     std::env::var("XDG_SESSION_TYPE").unwrap_or_else(|_| "unknown".to_string())
+}
+
+/// `GNOME Shell 50.1`, when the shell can be asked. Which version is running is
+/// the second question after "is it running": the extension declares the versions
+/// it supports, and a mismatch is the difference between a bug report and a
+/// supported installation.
+fn gnome_shell_version() -> Option<String> {
+    let output = install::command_output("gnome-shell", &["--version"]);
+    let line = output.lines().next()?.trim();
+    if line.is_empty() {
+        None
+    } else {
+        Some(line.to_string())
+    }
 }
 
 /// What gnome-shell currently has loaded for this extension: `(state, version)`.
@@ -1287,47 +1480,93 @@ fn activation_token() -> String {
         .unwrap_or_default()
 }
 
-/// Tiny option parser: `--flag`, `--key value` and `--key=value`.
+/// Everything an option may be given to, and everything it may not.
+///
+/// `FLAGS` is the list a bare `--force` is checked against, so an option that
+/// works but is missing here would print a warning that lies; `WITH_VALUE` is
+/// what decides whether the next token is consumed as a value.
+const WITH_VALUE: [&str; 4] = ["--limit", "--out", "--search", "--binding"];
+const FLAGS: [&str; 3] = ["--json", "--raw", "--force"];
+
+/// Tiny option parser: `--flag`, `--key value`, `--key=value`, and `--` to stop
+/// reading options.
 #[derive(Default)]
 struct Args {
     positional: Vec<String>,
     values: Vec<(String, String)>,
     flags: Vec<String>,
-    /// Options this build does not know about. Worth mentioning, since a typo
-    /// like `--limt 5` would otherwise be dropped in silence.
-    unknown: Vec<String>,
+    /// Things worth stopping for: an option this build does not know, or one
+    /// that was left without the value it needs. A typo like `--limt 5` used to
+    /// print a warning and then list the whole history anyway, which is the
+    /// quiet sort of wrong.
+    problems: Vec<String>,
 }
 
 impl Args {
-    const WITH_VALUE: [&'static str; 4] = ["--limit", "--out", "--search", "--binding"];
-    const FLAGS: [&'static str; 2] = ["--json", "--raw"];
-
     fn parse(tokens: Vec<String>) -> Self {
         let mut args = Args::default();
-        let mut tokens = tokens.into_iter();
+        let mut tokens = tokens.into_iter().peekable();
+        let mut only_positional = false;
         while let Some(token) = tokens.next() {
+            if only_positional {
+                args.positional.push(token);
+                continue;
+            }
+            if token == "--" {
+                only_positional = true;
+                continue;
+            }
             if let Some(rest) = token.strip_prefix("--") {
                 let (name, inline) = match rest.split_once('=') {
                     Some((name, value)) => (format!("--{name}"), Some(value.to_string())),
                     None => (token.clone(), None),
                 };
-                if Self::WITH_VALUE.contains(&name.as_str()) {
-                    let value = inline.or_else(|| tokens.next()).unwrap_or_default();
-                    args.values.push((name, value));
-                } else {
-                    if !Self::FLAGS.contains(&name.as_str()) {
-                        args.unknown.push(name.clone());
+                let inline = inline.filter(|value| !value.is_empty());
+                if WITH_VALUE.contains(&name.as_str()) {
+                    // A following token that is itself an option is not a value:
+                    // `--limit --json` used to read `--json` as the number.
+                    let consumed = match tokens.peek() {
+                        None => None,
+                        Some(next) if Self::looks_like_option(next) => None,
+                        Some(next) => Some(next.clone()),
+                    };
+                    let from_next = inline.is_none();
+                    match inline.or(consumed) {
+                        Some(value) => {
+                            if from_next {
+                                tokens.next();
+                            }
+                            args.values.push((name, value));
+                        }
+                        None => args.problems.push(format!("{name} needs a value")),
                     }
+                } else if FLAGS.contains(&name.as_str()) {
+                    if let Some(value) = inline {
+                        args.problems
+                            .push(format!("{name} does not take a value (got '{value}')"));
+                    }
+                    args.flags.push(name);
+                } else {
+                    args.problems
+                        .push(format!("{name} is not an option this build knows"));
                     args.flags.push(name);
                 }
             } else if token.starts_with('-') && token.len() > 1 {
-                args.unknown.push(token.clone());
+                args.problems
+                    .push(format!("{token} is not an option this build knows"));
                 args.flags.push(token);
             } else {
                 args.positional.push(token);
             }
         }
         args
+    }
+
+    /// True for `--` and for anything spelled like a long option. A single-dash
+    /// value (`--search -foo`) is still a value, so a search for a dash-leading
+    /// string keeps working.
+    fn looks_like_option(token: &str) -> bool {
+        token == "--" || token.starts_with("--")
     }
 
     fn value(&self, name: &str) -> Option<&str> {
@@ -1378,16 +1617,76 @@ mod tests {
         assert!(args.has("--json"));
         assert_eq!(args.value("--out"), Some("shot.png"));
         assert_eq!(args.id(), Some(12));
-        assert!(args.unknown.is_empty());
+        assert!(args.problems.is_empty());
     }
 
     #[test]
-    fn collects_options_it_does_not_know() {
+    fn knows_every_option_the_help_text_offers() {
+        // The bug this pins down: `--force` worked but was missing from the list
+        // of known flags, so every `clipnest export dir --force` printed a
+        // warning about an option it had just honoured.
+        for option in ["--json", "--raw", "--force"] {
+            let args = parse(&[option]);
+            assert!(args.has(option), "{option} did not register");
+            assert!(args.problems.is_empty(), "{option} was called unknown");
+        }
+        for option in ["--limit", "--out", "--search", "--binding"] {
+            let args = parse(&[option, "x"]);
+            assert_eq!(args.value(option), Some("x"), "{option} did not register");
+            assert!(args.problems.is_empty(), "{option} was called unknown");
+        }
+    }
+
+    #[test]
+    fn stops_on_an_option_it_does_not_know() {
         // A typo has to be visible: silently listing the whole history instead
-        // of the five entries the user asked for is worse than a warning.
+        // of the five entries the user asked for is worse than a complaint.
         let args = parse(&["--limt", "5", "--search", "needle", "-x"]);
-        assert_eq!(args.unknown, vec!["--limt".to_string(), "-x".to_string()]);
+        assert_eq!(
+            args.problems,
+            vec![
+                "--limt is not an option this build knows".to_string(),
+                "-x is not an option this build knows".to_string(),
+            ]
+        );
         assert_eq!(args.value("--search"), Some("needle"));
+    }
+
+    #[test]
+    fn stops_on_an_option_left_without_its_value() {
+        assert_eq!(
+            parse(&["--limit"]).problems,
+            vec!["--limit needs a value".to_string()]
+        );
+        assert_eq!(
+            parse(&["--out", "--json"]).problems,
+            vec!["--out needs a value".to_string()]
+        );
+        assert_eq!(
+            parse(&["--search="]).problems,
+            vec!["--search needs a value".to_string()]
+        );
+        // A value that happens to start with a single dash is still a value.
+        let args = parse(&["--search", "-foo"]);
+        assert_eq!(args.value("--search"), Some("-foo"));
+        assert!(args.problems.is_empty());
+    }
+
+    #[test]
+    fn a_flag_refuses_a_value() {
+        assert_eq!(
+            parse(&["--json=1"]).problems,
+            vec!["--json does not take a value (got '1')".to_string()]
+        );
+    }
+
+    #[test]
+    fn two_dashes_end_the_options() {
+        // Without this, searching for a string that starts with a dash would be
+        // impossible to write down.
+        let args = parse(&["search", "--", "--limit", "5"]);
+        assert_eq!(args.positional, vec!["search", "--limit", "5"]);
+        assert!(args.problems.is_empty());
     }
 
     #[test]
@@ -1405,6 +1704,95 @@ mod tests {
         // `clipnest search hello world` used to drop the second word.
         let args = parse(&["hello", "world", "--limit", "3"]);
         assert_eq!(args.positional.join(" "), "hello world");
+    }
+
+    /// The rows `clipnest list --json` prints, as a machine reads them. The
+    /// escaping used to be checked by comparing strings, which cannot tell
+    /// "valid JSON" from "looks a bit like JSON".
+    #[test]
+    fn the_json_output_is_json() {
+        let rows = vec![
+            row(1, "text", "plain"),
+            row(2, "text", "a \"quote\" and a \\ backslash"),
+            row(3, "text", "two\nlines\tand a tab"),
+            row(4, "text", "carriage\rreturn"),
+            row(5, "text", "bell\u{7} and a nul\u{0} byte"),
+            row(6, "text", "سلام دنیا \u{1f680} \u{2028} line separator"),
+            row(7, "image", "\u{feff}\u{200d}\u{fffd}"),
+            row(8, "text", &"x".repeat(50_000)),
+        ];
+        let text = json_array(&rows);
+        let parsed: serde_json::Value =
+            serde_json::from_str(&text).expect("the CLI printed something that is not JSON");
+        let array = parsed.as_array().expect("a JSON array");
+        assert_eq!(array.len(), rows.len());
+        for (index, value) in array.iter().enumerate() {
+            assert_eq!(value["id"], serde_json::json!(rows[index].id));
+            assert_eq!(
+                value["preview"].as_str(),
+                Some(rows[index].preview.as_str()),
+                "row {index} did not survive the round trip"
+            );
+            assert_eq!(value["pinned"], serde_json::json!(rows[index].pinned));
+        }
+        // An empty history is an empty array, not an empty string.
+        assert_eq!(json_array(&[]), "[]");
+    }
+
+    fn row(id: u32, kind: &str, preview: &str) -> Row {
+        Row {
+            id,
+            kind: kind.to_string(),
+            preview: preview.to_string(),
+            width: 0,
+            height: 0,
+            pinned: id.is_multiple_of(2),
+        }
+    }
+
+    #[test]
+    fn judges_the_session_it_is_running_in() {
+        // The supported combination, and the one that looks identical until you
+        // notice that nothing is being captured.
+        assert_eq!(
+            classify_session("ubuntu:GNOME", "wayland", true, true),
+            SessionState::Supported
+        );
+        // The one that matters on this project's own target machine: Ubuntu
+        // 26.04 calls its GNOME session "Unity".
+        assert_eq!(
+            classify_session("Unity", "wayland", true, true),
+            SessionState::Supported
+        );
+        assert_eq!(
+            classify_session("Unity", "wayland", false, true),
+            SessionState::ExtensionsOff
+        );
+        // gnome-shell installed but a session that is not Wayland is not the
+        // tested path, whatever the desktop calls itself.
+        assert_eq!(
+            classify_session("GNOME", "x11", true, true),
+            SessionState::X11
+        );
+        assert_eq!(
+            classify_session("KDE", "x11", false, false),
+            SessionState::ForeignDesktop
+        );
+        // Wayland without gnome-shell: nothing can read the clipboard at all.
+        assert_eq!(
+            classify_session("sway", "wayland", false, false),
+            SessionState::ForeignDesktop
+        );
+        // No desktop and no shell: a shell that exports nothing is not a desktop
+        // we can judge (ssh, a container, a `sudo` shell).
+        assert_eq!(
+            classify_session("", "tty", false, false),
+            SessionState::Unknown
+        );
+        assert_eq!(
+            classify_session("", "", true, true),
+            SessionState::Unknown
+        );
     }
 
     #[test]
