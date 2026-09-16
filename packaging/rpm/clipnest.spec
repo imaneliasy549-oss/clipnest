@@ -16,6 +16,7 @@
 # install on older, still-supported releases for no reason a user could act on.
 # Building from source is what the source tarball is for.
 
+%global debug_package %{nil}
 Name:           clipnest
 Version:        @VERSION@
 Release:        1%{?dist}
@@ -103,3 +104,6 @@ echo "ClipNest: run 'clipnest setup' once as each user, then log out and back in
 %{_datadir}/gnome-shell/extensions/clipnest@clipnest.dev/extension.js
 
 %changelog
+
+* Tue Sep 16 2026 Iman Elyasi <imaneliasy549@gmail.com> - @VERSION@-1
+- Initial package for Fedora, RHEL and openSUSE
