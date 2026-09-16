@@ -64,7 +64,7 @@ jobs:
         run: make check
 
       - name: Install cargo-deb
-        run: cargo install cargo-deb --locked --version 3
+        run: cargo install cargo-deb --locked
 
       # `make dist` would also want the RPM and the Arch recipe; those come from
       # the jobs below, which have the right tooling for them.
